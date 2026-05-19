@@ -1,0 +1,6 @@
+yfinance>=0.2.40
+pandas>=2.0.0
+ta>=0.11.0
+playwright>=1.44.0
+requests>=2.31.0
+python-dotenv>=1.0.0
