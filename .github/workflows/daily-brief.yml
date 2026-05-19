@@ -1,0 +1,60 @@
+name: Daily Grain Brief
+
+on:
+  schedule:
+    # Mon-Fri at 22:00 UTC = ~4pm CDT (UTC-5) / 5pm CST (UTC-6)
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (build email but do not send)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  send-daily-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Run Daily Grain Brief
+        run: python -m src.daily_brief
+        env:
+          GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SCOULAR_USER: ${{ secrets.SCOULAR_USER }}
+          SCOULAR_PASS: ${{ secrets.SCOULAR_PASS }}
+
+      - name: Commit and push bid history CSV
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "No changes to CSV data — nothing to commit"
+          else
+            git commit -m "chore: update bid history CSV [$(date -u '+%Y-%m-%d')]"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
