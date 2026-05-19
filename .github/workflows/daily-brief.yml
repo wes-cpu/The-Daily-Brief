@@ -43,6 +43,8 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SCOULAR_USER: ${{ secrets.SCOULAR_USER }}
           SCOULAR_PASS: ${{ secrets.SCOULAR_PASS }}
+          SCOULAR_EMAIL_USER: ${{ secrets.SCOULAR_EMAIL_USER }}
+          SCOULAR_EMAIL_PASS: ${{ secrets.SCOULAR_EMAIL_PASS }}
 
       - name: Commit and push bid history CSV
         if: always()

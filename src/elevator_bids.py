@@ -14,10 +14,13 @@ Each scraper function is async and returns a list of bid dicts:
 """
 
 import asyncio
+import email as email_lib
+import imaplib
 import json
 import logging
 import os
 import re
+import time
 from typing import Optional
 
 from playwright.async_api import async_playwright, Page, BrowserContext
@@ -26,6 +29,84 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 DEFAULT_TIMEOUT = 30_000  # 30 seconds in ms
+
+
+# ---------------------------------------------------------------------------
+# IMAP helper — reads Scoular MFA code from wes@seifert.farm (Google Workspace)
+# ---------------------------------------------------------------------------
+
+def _fetch_scoular_mfa_code(
+    imap_user: str,
+    imap_pass: str,
+    imap_host: str = "imap.gmail.com",
+    wait_seconds: int = 60,
+    poll_interval: int = 5,
+) -> Optional[str]:
+    """
+    Poll the inbox at imap_user (Google Workspace / Gmail) for a Scoular
+    security-code email, retrying every poll_interval seconds for up to
+    wait_seconds total.  Returns the extracted numeric code, or None on failure.
+    """
+    deadline = time.monotonic() + wait_seconds
+    attempt = 0
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            with imaplib.IMAP4_SSL(imap_host) as mail:
+                mail.login(imap_user, imap_pass)
+                mail.select("INBOX")
+
+                # Search for recent Scoular emails (last 10 minutes is plenty)
+                # SINCE is date-only in IMAP; combine with a body/subject search.
+                status, msg_ids = mail.search(
+                    None,
+                    '(FROM "scoular" SUBJECT "security" UNSEEN)',
+                )
+                if status != "OK" or not msg_ids[0]:
+                    # Broaden: any unseen Scoular email
+                    status, msg_ids = mail.search(None, '(FROM "scoular" UNSEEN)')
+
+                if status == "OK" and msg_ids[0]:
+                    ids = msg_ids[0].split()
+                    # Check the most recent matching message
+                    raw = mail.fetch(ids[-1], "(RFC822)")[1][0][1]
+                    msg = email_lib.message_from_bytes(raw)
+
+                    # Walk all parts looking for the code
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == "text/plain":
+                                body += part.get_payload(decode=True).decode(errors="replace")
+                    else:
+                        body = msg.get_payload(decode=True).decode(errors="replace")
+
+                    # Scoular codes are typically 6-digit numbers
+                    match = re.search(r"\b(\d{6})\b", body)
+                    if match:
+                        code = match.group(1)
+                        logger.info(f"Scoular MFA: found code {code} in email (attempt {attempt})")
+                        # Mark the message as seen so we don't re-use it
+                        mail.store(ids[-1], "+FLAGS", "\\Seen")
+                        return code
+                    else:
+                        logger.debug(f"Scoular MFA: email found but no 6-digit code in body (attempt {attempt})")
+                else:
+                    logger.debug(f"Scoular MFA: no matching email yet (attempt {attempt})")
+
+        except imaplib.IMAP4.error as exc:
+            logger.error(f"Scoular MFA IMAP error: {exc}")
+            return None  # auth failure — no point retrying
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            sleep_for = min(poll_interval, remaining)
+            logger.info(f"Scoular MFA: waiting {sleep_for:.0f}s for code email… ({remaining:.0f}s remaining)")
+            time.sleep(sleep_for)
+
+    logger.error(f"Scoular MFA: code not received within {wait_seconds}s")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -206,80 +287,134 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
 
 async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
     """
-    Scoular CBLOC — requires login with SCOULAR_USER / SCOULAR_PASS env vars.
-    Returns empty list and logs a warning if credentials are not provided.
+    Scoular CBLOC — full MFA-aware login.
+
+    Required env vars:
+      SCOULAR_USER        Scoular account username / email
+      SCOULAR_PASS        Scoular account password
+      SCOULAR_EMAIL_USER  wes@seifert.farm  (receives the MFA code)
+      SCOULAR_EMAIL_PASS  App password for wes@seifert.farm (Google Workspace)
     """
     elevator_name = "Scoular CBLOC"
     url = "https://scoularview.com/cbloc-1941"
+
     username = os.environ.get("SCOULAR_USER", "")
     password = os.environ.get("SCOULAR_PASS", "")
+    email_user = os.environ.get("SCOULAR_EMAIL_USER", "")
+    email_pass = os.environ.get("SCOULAR_EMAIL_PASS", "")
 
     if not username or not password:
-        logger.warning(f"{elevator_name}: credentials not provided (SCOULAR_USER/SCOULAR_PASS); skipping")
+        logger.warning(f"{elevator_name}: SCOULAR_USER/SCOULAR_PASS not set; skipping")
         return []
+    if not email_user or not email_pass:
+        logger.warning(f"{elevator_name}: SCOULAR_EMAIL_USER/SCOULAR_EMAIL_PASS not set; skipping MFA code retrieval")
 
-    page = await _new_page(context)
+    page = await _new_page(context, timeout=60_000)
     try:
         logger.info(f"{elevator_name}: navigating to {url}")
-        await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+        await page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # Check if we're redirected to a login page
-        current_url = page.url
-        if "login" in current_url.lower() or "signin" in current_url.lower() or "auth" in current_url.lower():
-            logger.info(f"{elevator_name}: login page detected; attempting login")
-        else:
-            # Look for login form on the page
-            login_form = await page.query_selector("form[action*='login'], input[name='username'], input[name='email'], input[type='email']")
-            if not login_form:
-                # Already logged in or different flow
-                logger.info(f"{elevator_name}: no login form found, attempting to read bids directly")
-            else:
-                logger.info(f"{elevator_name}: login form found on page; logging in")
-
-        # Attempt to fill login fields
+        # ── Step 1: fill username + password ────────────────────────────────
         user_field = await page.query_selector(
-            "input[name='username'], input[name='email'], input[type='email'], input[id*='user'], input[placeholder*='Username'], input[placeholder*='Email']"
+            "input[name='username'], input[name='email'], input[type='email'], "
+            "input[id*='user'], input[placeholder*='Username'], input[placeholder*='Email']"
         )
         pass_field = await page.query_selector(
             "input[name='password'], input[type='password'], input[id*='pass']"
         )
 
-        if user_field and pass_field:
+        if not user_field or not pass_field:
+            logger.warning(f"{elevator_name}: login fields not found; page may have changed")
+        else:
             await user_field.fill(username)
             await pass_field.fill(password)
             submit = await page.query_selector(
-                "button[type='submit'], input[type='submit'], button[class*='login'], button[class*='sign']"
+                "button[type='submit'], input[type='submit'], "
+                "button[class*='login'], button[class*='sign-in']"
             )
             if submit:
                 await submit.click()
             else:
                 await pass_field.press("Enter")
-            await page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
-            logger.info(f"{elevator_name}: login submitted; current URL: {page.url}")
+            logger.info(f"{elevator_name}: credentials submitted; waiting for response…")
+            await page.wait_for_load_state("networkidle", timeout=60_000)
+
+        # ── Step 2: detect MFA prompt ────────────────────────────────────────
+        # Scoular shows a code input field after password; common selectors:
+        mfa_selectors = [
+            "input[name='code']",
+            "input[name='otp']",
+            "input[name='token']",
+            "input[name='security_code']",
+            "input[placeholder*='code' i]",
+            "input[placeholder*='security' i]",
+            "input[aria-label*='code' i]",
+            "input[maxlength='6']",
+        ]
+        mfa_field = None
+        for sel in mfa_selectors:
+            mfa_field = await page.query_selector(sel)
+            if mfa_field:
+                logger.info(f"{elevator_name}: MFA prompt detected (selector: {sel})")
+                break
+
+        if mfa_field:
+            if not email_user or not email_pass:
+                logger.error(f"{elevator_name}: MFA required but SCOULAR_EMAIL_USER/PASS not configured; skipping")
+                return []
+
+            # Fetch the code from wes@seifert.farm via IMAP (runs in thread to avoid blocking event loop)
+            loop = asyncio.get_event_loop()
+            code = await loop.run_in_executor(
+                None,
+                _fetch_scoular_mfa_code,
+                email_user,
+                email_pass,
+                "imap.gmail.com",
+                90,   # wait up to 90 seconds
+                5,    # poll every 5 seconds
+            )
+
+            if not code:
+                logger.error(f"{elevator_name}: MFA code not retrieved; skipping")
+                return []
+
+            await mfa_field.fill(code)
+            mfa_submit = await page.query_selector(
+                "button[type='submit'], input[type='submit'], "
+                "button[class*='verify'], button[class*='confirm'], button[class*='submit']"
+            )
+            if mfa_submit:
+                await mfa_submit.click()
+            else:
+                await mfa_field.press("Enter")
+            logger.info(f"{elevator_name}: MFA code submitted; waiting for post-login page…")
+            await page.wait_for_load_state("networkidle", timeout=60_000)
         else:
-            logger.warning(f"{elevator_name}: could not find login fields; attempting to read bids anyway")
+            logger.info(f"{elevator_name}: no MFA prompt detected; continuing")
 
-        # After login, navigate to bids if we were redirected elsewhere
+        # ── Step 3: navigate to bids page if redirected elsewhere ────────────
         if url not in page.url:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            logger.info(f"{elevator_name}: navigating to bids page ({url})")
+            await page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # Try to extract bids from the page
+        # ── Step 4: extract bids ─────────────────────────────────────────────
         bids = await _parse_barchart_html(page, elevator_name)
         if not bids:
-            # Also try a table-based approach for Scoular's specific layout
             rows = await page.query_selector_all("tr, .bid-row, .market-row")
             for row in rows:
                 text = await row.inner_text()
-                cells_text = text.split("\t") if "\t" in text else text.split("\n")
-                if len(cells_text) >= 3:
-                    commodity = cells_text[0].strip()
+                cells = text.split("\t") if "\t" in text else text.split("\n")
+                cells = [c.strip() for c in cells if c.strip()]
+                if len(cells) >= 3:
+                    commodity = cells[0]
                     if any(c in commodity.lower() for c in ["corn", "soybean", "wheat", "beans"]):
-                        cash_raw = next((c for c in cells_text[1:] if re.search(r"\d+\.\d+", c)), "")
-                        basis_raw = next((c for c in cells_text[1:] if re.search(r"[+\-]\d+", c)), "")
+                        cash_raw = next((c for c in cells[1:] if re.search(r"\d+\.\d{2}", c)), "")
+                        basis_raw = next((c for c in cells[1:] if re.search(r"^[+\-]?\d+$", c)), "")
                         bids.append({
                             "elevator": elevator_name,
                             "commodity": commodity,
-                            "delivery_period": cells_text[1].strip() if len(cells_text) > 1 else "",
+                            "delivery_period": cells[1] if len(cells) > 1 else "",
                             "cash_price": _parse_price(cash_raw),
                             "basis": _parse_basis(basis_raw),
                             "futures_reference": "",
@@ -289,8 +424,8 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
         logger.info(f"{elevator_name}: extracted {len(bids)} bids")
         return bids
 
-    except Exception as e:
-        logger.error(f"{elevator_name}: error: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error(f"{elevator_name}: error — {exc}", exc_info=True)
         return []
     finally:
         await page.close()
