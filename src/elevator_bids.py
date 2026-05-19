@@ -287,126 +287,96 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
 
 async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
     """
-    Scoular CBLOC — full MFA-aware login.
+    Scoular CBLOC — cookie-first authentication.
 
-    Required env vars:
-      SCOULAR_USER        Scoular account username / email
-      SCOULAR_PASS        Scoular account password
-      SCOULAR_EMAIL_USER  wes@seifert.farm  (receives the MFA code)
-      SCOULAR_EMAIL_PASS  App password for wes@seifert.farm (Google Workspace)
+    Primary method (SCOULAR_COOKIES set):
+      Log in manually once using get_scoular_cookies.py, paste the JSON output
+      as the SCOULAR_COOKIES GitHub secret.  No MFA required on subsequent runs.
+      Refresh the secret when cookies expire (typically every 30–90 days).
+
+    Fallback method (SCOULAR_USER + SCOULAR_PASS set, no cookies):
+      Attempts username/password login.  If Scoular demands an MFA code the
+      run will be skipped with a clear error — refresh SCOULAR_COOKIES instead.
     """
     elevator_name = "Scoular CBLOC"
     url = "https://scoularview.com/cbloc-1941"
 
+    cookies_json = os.environ.get("SCOULAR_COOKIES", "")
     username = os.environ.get("SCOULAR_USER", "")
     password = os.environ.get("SCOULAR_PASS", "")
-    email_user = os.environ.get("SCOULAR_EMAIL_USER", "")
-    email_pass = os.environ.get("SCOULAR_EMAIL_PASS", "")
 
-    if not username or not password:
-        logger.warning(f"{elevator_name}: SCOULAR_USER/SCOULAR_PASS not set; skipping")
+    if not cookies_json and not (username and password):
+        logger.warning(f"{elevator_name}: no credentials configured (set SCOULAR_COOKIES); skipping")
         return []
-
-    # Fall back to the sending Gmail account if dedicated Scoular email creds aren't set.
-    # Requires a forwarding rule: wes@seifert.farm → wesseifert1995@gmail.com for scoular.com emails.
-    if not email_user or not email_pass:
-        email_user = os.environ.get("GMAIL_FROM", "")
-        email_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
-        if email_user and email_pass:
-            logger.info(f"{elevator_name}: using GMAIL_FROM account to read MFA code (forwarding rule assumed)")
-        else:
-            logger.warning(f"{elevator_name}: no email credentials available for MFA code; skipping")
 
     page = await _new_page(context, timeout=60_000)
     try:
-        logger.info(f"{elevator_name}: navigating to {url}")
-        await page.goto(url, wait_until="networkidle", timeout=60_000)
-
-        # ── Step 1: fill username + password ────────────────────────────────
-        user_field = await page.query_selector(
-            "input[name='username'], input[name='email'], input[type='email'], "
-            "input[id*='user'], input[placeholder*='Username'], input[placeholder*='Email']"
-        )
-        pass_field = await page.query_selector(
-            "input[name='password'], input[type='password'], input[id*='pass']"
-        )
-
-        if not user_field or not pass_field:
-            logger.warning(f"{elevator_name}: login fields not found; page may have changed")
-        else:
-            await user_field.fill(username)
-            await pass_field.fill(password)
-            submit = await page.query_selector(
-                "button[type='submit'], input[type='submit'], "
-                "button[class*='login'], button[class*='sign-in']"
-            )
-            if submit:
-                await submit.click()
-            else:
-                await pass_field.press("Enter")
-            logger.info(f"{elevator_name}: credentials submitted; waiting for response…")
-            await page.wait_for_load_state("networkidle", timeout=60_000)
-
-        # ── Step 2: detect MFA prompt ────────────────────────────────────────
-        # Scoular shows a code input field after password; common selectors:
-        mfa_selectors = [
-            "input[name='code']",
-            "input[name='otp']",
-            "input[name='token']",
-            "input[name='security_code']",
-            "input[placeholder*='code' i]",
-            "input[placeholder*='security' i]",
-            "input[aria-label*='code' i]",
-            "input[maxlength='6']",
-        ]
-        mfa_field = None
-        for sel in mfa_selectors:
-            mfa_field = await page.query_selector(sel)
-            if mfa_field:
-                logger.info(f"{elevator_name}: MFA prompt detected (selector: {sel})")
-                break
-
-        if mfa_field:
-            if not email_user or not email_pass:
-                logger.error(f"{elevator_name}: MFA required but SCOULAR_EMAIL_USER/PASS not configured; skipping")
+        # ── Method 1: inject saved session cookies ───────────────────────────
+        if cookies_json:
+            try:
+                cookies = json.loads(cookies_json)
+                await context.add_cookies(cookies)
+                logger.info(f"{elevator_name}: injected {len(cookies)} saved cookies")
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.error(f"{elevator_name}: failed to parse SCOULAR_COOKIES — {exc}")
                 return []
 
-            # Fetch the code from wes@seifert.farm via IMAP (runs in thread to avoid blocking event loop)
-            loop = asyncio.get_event_loop()
-            code = await loop.run_in_executor(
-                None,
-                _fetch_scoular_mfa_code,
-                email_user,
-                email_pass,
-                "imap.gmail.com",
-                90,   # wait up to 90 seconds
-                5,    # poll every 5 seconds
-            )
-
-            if not code:
-                logger.error(f"{elevator_name}: MFA code not retrieved; skipping")
-                return []
-
-            await mfa_field.fill(code)
-            mfa_submit = await page.query_selector(
-                "button[type='submit'], input[type='submit'], "
-                "button[class*='verify'], button[class*='confirm'], button[class*='submit']"
-            )
-            if mfa_submit:
-                await mfa_submit.click()
-            else:
-                await mfa_field.press("Enter")
-            logger.info(f"{elevator_name}: MFA code submitted; waiting for post-login page…")
-            await page.wait_for_load_state("networkidle", timeout=60_000)
-        else:
-            logger.info(f"{elevator_name}: no MFA prompt detected; continuing")
-
-        # ── Step 3: navigate to bids page if redirected elsewhere ────────────
-        if url not in page.url:
-            logger.info(f"{elevator_name}: navigating to bids page ({url})")
             await page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # ── Step 4: extract bids ─────────────────────────────────────────────
+            # Check whether we landed on the bids page or got bounced to login
+            if any(kw in page.url.lower() for kw in ("login", "signin", "auth")):
+                logger.error(
+                    f"{elevator_name}: cookies appear expired — log in manually and "
+                    "re-run get_scoular_cookies.py to refresh SCOULAR_COOKIES"
+                )
+                return []
+
+            logger.info(f"{elevator_name}: cookie login succeeded; on {page.url}")
+
+        # ── Method 2: username + password (no MFA support) ───────────────────
+        else:
+            logger.info(f"{elevator_name}: no cookies; attempting username/password login")
+            await page.goto(url, wait_until="networkidle", timeout=60_000)
+
+            user_field = await page.query_selector(
+                "input[name='username'], input[name='email'], input[type='email'], "
+                "input[id*='user'], input[placeholder*='Username'], input[placeholder*='Email']"
+            )
+            pass_field = await page.query_selector(
+                "input[name='password'], input[type='password'], input[id*='pass']"
+            )
+
+            if not user_field or not pass_field:
+                logger.warning(f"{elevator_name}: login fields not found on page")
+            else:
+                await user_field.fill(username)
+                await pass_field.fill(password)
+                submit = await page.query_selector(
+                    "button[type='submit'], input[type='submit'], "
+                    "button[class*='login'], button[class*='sign-in']"
+                )
+                if submit:
+                    await submit.click()
+                else:
+                    await pass_field.press("Enter")
+                await page.wait_for_load_state("networkidle", timeout=60_000)
+
+            # If an MFA field appeared we cannot proceed without the cookie method
+            mfa_present = await page.query_selector(
+                "input[name='code'], input[name='otp'], input[name='token'], "
+                "input[maxlength='6'], input[placeholder*='code' i], input[placeholder*='security' i]"
+            )
+            if mfa_present:
+                logger.error(
+                    f"{elevator_name}: MFA prompt detected — run get_scoular_cookies.py locally, "
+                    "log in with the security code, and store the output as SCOULAR_COOKIES"
+                )
+                return []
+
+            if url not in page.url:
+                await page.goto(url, wait_until="networkidle", timeout=60_000)
+
+        # ── Extract bids ─────────────────────────────────────────────────────
         bids = await _parse_barchart_html(page, elevator_name)
         if not bids:
             rows = await page.query_selector_all("tr, .bid-row, .market-row")
