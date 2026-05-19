@@ -323,13 +323,16 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
 
             await page.goto(url, wait_until="networkidle", timeout=60_000)
 
-            # Check whether we landed on the bids page or got bounced to login
-            if any(kw in page.url.lower() for kw in ("login", "signin", "auth")):
+            # Check whether we landed on the bids page or got bounced to login.
+            # Scoular auth routes through Bushel (app.bushelfarm.com / grain.bushel.ag),
+            # so an expired session redirects to a Bushel domain, not just scoularview.com.
+            bounced = any(kw in page.url.lower() for kw in ("login", "signin", "auth", "bushel"))
+            if bounced and "scoularview.com" not in page.url.lower():
                 logger.error(
-                    f"{elevator_name}: cookies appear expired — log in manually and "
-                    "re-run get_scoular_cookies.py to refresh SCOULAR_COOKIES"
+                    f"{elevator_name}: cookies appear expired (landed on {page.url}) — "
+                    "re-run get_scoular_cookies.py locally and update SCOULAR_COOKIES"
                 )
-                return []
+                return [], []
 
             logger.info(f"{elevator_name}: cookie login succeeded; on {page.url}")
 
@@ -407,7 +410,9 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
         fresh_cookies: list[dict] = []
         if bids:
             try:
-                fresh_cookies = await context.cookies(["https://scoularview.com"])
+                # Capture all cookies — Scoular auth runs through Bushel (bushel.ag),
+                # so we need both Bushel and Scoularview cookies for the session to work.
+                fresh_cookies = await context.cookies()
                 logger.info(f"{elevator_name}: captured {len(fresh_cookies)} fresh cookies for rotation")
             except Exception as exc:
                 logger.debug(f"{elevator_name}: could not capture fresh cookies: {exc}")
