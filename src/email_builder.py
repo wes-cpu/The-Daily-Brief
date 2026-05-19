@@ -130,6 +130,7 @@ def build_email(
     futures_data: dict,
     elevator_bids: dict[str, list[dict]],
     basis_trends: dict[str, dict],
+    elevator_spreads: Optional[dict] = None,
     report_date: Optional[date] = None,
 ) -> str:
     """
@@ -168,6 +169,7 @@ def build_email(
     html_technicals = _build_technicals_table(front_month)
     html_elevator_bids = _build_elevator_bids_section(elevator_bids)
     html_basis_trends = _build_basis_trends_section(basis_trends, elevator_bids)
+    html_elevator_spreads = _build_elevator_spreads_section(elevator_spreads or {})
     html_warnings = _build_warnings(failed_elevators)
 
     # -----------------------------------------------------------------------
@@ -269,6 +271,14 @@ def build_email(
         Basis Trends
       </h2>
       {html_basis_trends}
+
+      <!-- Elevator Cash Bid Deferred Spreads -->
+      <h2 style="font-size:15px;font-weight:700;color:{COLOR_PRIMARY};
+                 border-bottom:2px solid {COLOR_PRIMARY};padding-bottom:6px;
+                 margin:24px 0 12px 0;font-family:Arial,sans-serif;">
+        Elevator Deferred Spread vs. Front Month
+      </h2>
+      {html_elevator_spreads}
 
     </td>
   </tr>
@@ -425,6 +435,14 @@ def _build_deferred_table(deferred: dict) -> str:
             spread_str = _fmt_change(spread) if spread is not None else "N/A"
             price = _fmt_price(contract.get("price"), 4)
 
+            spread_change = contract.get("spread_change")
+            if spread_change is None:
+                sc_str = "<span style='color:#9ca3af;font-size:11px;'>no prior data</span>"
+            else:
+                sc_color = _change_color(spread_change)
+                arrow = "▲" if spread_change > 0 else ("▼" if spread_change < 0 else "→")
+                sc_str = f'<span style="color:{sc_color};font-weight:600;">{arrow} {_fmt_change(spread_change)}</span>'
+
             rows_html += f"""
         <tr>
           <td style="{_td_style(alt)}">{commodity_emojis.get(commodity,'')} {commodity.title()}</td>
@@ -432,6 +450,7 @@ def _build_deferred_table(deferred: dict) -> str:
           <td style="{_td_style(alt)};">{contract.get('month_name','')}</td>
           <td style="{_td_style(alt)};font-weight:600;">{price}</td>
           <td style="{_td_style(alt)};color:{spread_color};font-weight:600;">{spread_str}</td>
+          <td style="{_td_style(alt)};">{sc_str}</td>
         </tr>"""
             row_idx += 1
 
@@ -447,6 +466,7 @@ def _build_deferred_table(deferred: dict) -> str:
           <th style="{_th_style()}">Month</th>
           <th style="{_th_style()}">Price ($/bu)</th>
           <th style="{_th_style()}">Spread vs Front</th>
+          <th style="{_th_style()}">Spread Change</th>
         </tr>
       </thead>
       <tbody>
@@ -691,6 +711,78 @@ def _build_basis_trends_section(
           <th style="{_th_style()}">1-Wk Trend</th>
           <th style="{_th_style()}">2-Wk Trend</th>
           <th style="{_th_style()}">1-Mo Trend</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_html}
+      </tbody>
+    </table>"""
+
+
+def _build_elevator_spreads_section(elevator_spreads: dict) -> str:
+    """
+    Build a table showing each elevator's front-month vs deferred cash bid spreads,
+    with day-over-day spread change.
+    """
+    if not elevator_spreads:
+        return (
+            "<p style='color:#9ca3af;font-size:13px;'>"
+            "Only one delivery month available per location — no spread data.</p>"
+        )
+
+    rows_html = ""
+    row_idx = 0
+
+    for key in sorted(elevator_spreads.keys()):
+        parts = key.split("|", 1)
+        elevator = parts[0] if parts else key
+        commodity = parts[1] if len(parts) > 1 else ""
+        spread_rows = elevator_spreads[key]
+
+        for sr in spread_rows:
+            alt = row_idx % 2 == 1
+            spread_today = sr.get("spread_today")
+            spread_yesterday = sr.get("spread_yesterday")
+            spread_change = sr.get("spread_change")
+
+            spread_color = _change_color(spread_today)
+            spread_str = f"${spread_today:+.2f}" if spread_today is not None else "N/A"
+
+            if spread_change is None:
+                sc_str = "<span style='color:#9ca3af;font-size:11px;'>no prior data</span>"
+            else:
+                sc_color = _change_color(spread_change)
+                arrow = "▲" if spread_change > 0.005 else ("▼" if spread_change < -0.005 else "→")
+                sc_str = f'<span style="color:{sc_color};font-weight:600;">{arrow} ${spread_change:+.2f}</span>'
+
+            yesterday_str = f"${spread_yesterday:+.2f}" if spread_yesterday is not None else "—"
+
+            rows_html += f"""
+        <tr>
+          <td style="{_td_style(alt)};font-size:12px;">{elevator}</td>
+          <td style="{_td_style(alt)};font-size:12px;">{commodity}</td>
+          <td style="{_td_style(alt)};font-size:12px;">{sr.get('front_delivery','')}</td>
+          <td style="{_td_style(alt)};font-size:12px;">{sr.get('deferred_delivery','')}</td>
+          <td style="{_td_style(alt)};color:{spread_color};font-weight:600;">{spread_str}</td>
+          <td style="{_td_style(alt)};color:#6b7280;">{yesterday_str}</td>
+          <td style="{_td_style(alt)};">{sc_str}</td>
+        </tr>"""
+            row_idx += 1
+
+    if not rows_html:
+        return "<p style='color:#9ca3af;font-size:13px;'>No elevator deferred spread data available.</p>"
+
+    return f"""
+    <table style="{_table_style()}font-size:12px;">
+      <thead>
+        <tr>
+          <th style="{_th_style()}">Elevator</th>
+          <th style="{_th_style()}">Commodity</th>
+          <th style="{_th_style()}">Front Month</th>
+          <th style="{_th_style()}">Deferred Month</th>
+          <th style="{_th_style()}">Spread Today</th>
+          <th style="{_th_style()}">Spread Yesterday</th>
+          <th style="{_th_style()}">Change</th>
         </tr>
       </thead>
       <tbody>

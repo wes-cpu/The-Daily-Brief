@@ -256,3 +256,119 @@ def get_all_basis_trends(all_bids: dict[str, list[dict]]) -> dict[str, dict]:
                 seen.add(key)
                 trends[key] = get_basis_trend(elevator_name, commodity)
     return trends
+
+
+def get_elevator_spread_changes(all_bids: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """
+    For each elevator+commodity, compute the spread between the front-month cash bid
+    and each deferred-month bid.  Compare to yesterday's CSV data to show change.
+
+    Returns:
+        {
+          "Elevator Name|Corn": [
+            {
+              "front_delivery": str,
+              "front_cash": float,
+              "deferred_delivery": str,
+              "deferred_cash": float,
+              "spread_today": float,       # deferred - front  (¢ if basis, $/bu if cash)
+              "spread_yesterday": float | None,
+              "spread_change": float | None,
+            },
+            ...
+          ],
+          ...
+        }
+
+    Spread is computed on cash price ($/bu).  A negative spread means the deferred
+    month pays less than the front month (inverse carry / carry-out market).
+    """
+    df = _load_history()
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    results: dict[str, list[dict]] = {}
+
+    for elevator_name, bids in all_bids.items():
+        if not bids:
+            continue
+
+        # Group today's bids by commodity
+        by_commodity: dict[str, list[dict]] = {}
+        for bid in bids:
+            commodity = bid.get("commodity", "")
+            if commodity:
+                by_commodity.setdefault(commodity, []).append(bid)
+
+        for commodity, cbids in by_commodity.items():
+            # Sort by delivery period — treat the first as front month
+            # Delivery periods are strings like "Jul 2025", "Dec 2025", etc.
+            def _delivery_sort_key(b: dict) -> str:
+                return b.get("delivery_period", "") or ""
+
+            sorted_bids = sorted(cbids, key=_delivery_sort_key)
+            if len(sorted_bids) < 2:
+                continue  # need at least one deferred month
+
+            front = sorted_bids[0]
+            front_cash = front.get("cash_price")
+            if front_cash is None:
+                continue
+
+            key = f"{elevator_name}|{commodity}"
+            spread_list: list[dict] = []
+
+            for deferred_bid in sorted_bids[1:]:
+                deferred_cash = deferred_bid.get("cash_price")
+                if deferred_cash is None:
+                    continue
+
+                spread_today = deferred_cash - front_cash
+
+                # Look up yesterday's spread from CSV
+                spread_yesterday: Optional[float] = None
+                spread_change: Optional[float] = None
+
+                if not df.empty:
+                    yesterday_ts = pd.Timestamp(yesterday)
+                    front_del = front.get("delivery_period", "")
+                    defer_del = deferred_bid.get("delivery_period", "")
+
+                    mask_front = (
+                        (df["elevator"].str.lower() == elevator_name.lower()) &
+                        (df["commodity"].str.lower().str.contains(commodity.lower(), na=False)) &
+                        (df["delivery_period"] == front_del) &
+                        (df["date"].dt.normalize() >= yesterday_ts - timedelta(days=2)) &
+                        (df["date"].dt.normalize() <= yesterday_ts + timedelta(days=1))
+                    )
+                    mask_defer = (
+                        (df["elevator"].str.lower() == elevator_name.lower()) &
+                        (df["commodity"].str.lower().str.contains(commodity.lower(), na=False)) &
+                        (df["delivery_period"] == defer_del) &
+                        (df["date"].dt.normalize() >= yesterday_ts - timedelta(days=2)) &
+                        (df["date"].dt.normalize() <= yesterday_ts + timedelta(days=1))
+                    )
+
+                    front_rows = df[mask_front].sort_values("date")
+                    defer_rows = df[mask_defer].sort_values("date")
+
+                    if not front_rows.empty and not defer_rows.empty:
+                        prev_front_cash = float(front_rows["cash_price"].iloc[-1])
+                        prev_defer_cash = float(defer_rows["cash_price"].iloc[-1])
+                        spread_yesterday = prev_defer_cash - prev_front_cash
+                        spread_change = spread_today - spread_yesterday
+
+                spread_list.append({
+                    "front_delivery": front.get("delivery_period", ""),
+                    "front_cash": front_cash,
+                    "deferred_delivery": deferred_bid.get("delivery_period", ""),
+                    "deferred_cash": deferred_cash,
+                    "spread_today": spread_today,
+                    "spread_yesterday": spread_yesterday,
+                    "spread_change": spread_change,
+                })
+
+            if spread_list:
+                results[key] = spread_list
+
+    return results
