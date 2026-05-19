@@ -306,8 +306,16 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
     if not username or not password:
         logger.warning(f"{elevator_name}: SCOULAR_USER/SCOULAR_PASS not set; skipping")
         return []
+
+    # Fall back to the sending Gmail account if dedicated Scoular email creds aren't set.
+    # Requires a forwarding rule: wes@seifert.farm → wesseifert1995@gmail.com for scoular.com emails.
     if not email_user or not email_pass:
-        logger.warning(f"{elevator_name}: SCOULAR_EMAIL_USER/SCOULAR_EMAIL_PASS not set; skipping MFA code retrieval")
+        email_user = os.environ.get("GMAIL_FROM", "")
+        email_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
+        if email_user and email_pass:
+            logger.info(f"{elevator_name}: using GMAIL_FROM account to read MFA code (forwarding rule assumed)")
+        else:
+            logger.warning(f"{elevator_name}: no email credentials available for MFA code; skipping")
 
     page = await _new_page(context, timeout=60_000)
     try:
