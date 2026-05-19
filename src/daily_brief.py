@@ -57,9 +57,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     logger.info("--- Step 2: Scraping elevator cash bids ---")
     elevator_bids: dict[str, list[dict]] = {}
+    scoular_fresh_cookies: list[dict] = []
     try:
         from src.elevator_bids import fetch_all_elevator_bids
-        elevator_bids = asyncio.run(fetch_all_elevator_bids())
+        elevator_bids, scoular_fresh_cookies = asyncio.run(fetch_all_elevator_bids())
         success_count = sum(1 for v in elevator_bids.values() if v)
         fail_count = sum(1 for v in elevator_bids.values() if not v)
         total_bids = sum(len(v) for v in elevator_bids.values())
@@ -67,7 +68,6 @@ def main() -> None:
             f"Elevator bids: {success_count} elevators loaded, "
             f"{fail_count} failed, {total_bids} total bid records"
         )
-        # Log which elevators failed
         for name, bids in elevator_bids.items():
             if not bids:
                 logger.warning(f"  FAILED: {name}")
@@ -76,6 +76,17 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Elevator bid scraping failed: {e}", exc_info=True)
         logger.warning("Continuing with empty elevator data")
+
+    # ------------------------------------------------------------------
+    # Step 2b: Auto-rotate Scoular session cookies (keeps login alive forever)
+    # ------------------------------------------------------------------
+    if scoular_fresh_cookies:
+        logger.info("--- Step 2b: Rotating SCOULAR_COOKIES secret ---")
+        try:
+            from src.secret_updater import refresh_scoular_cookies
+            refresh_scoular_cookies(scoular_fresh_cookies)
+        except Exception as e:
+            logger.error(f"Cookie rotation failed (non-fatal): {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # Step 3: Save today's bids to CSV

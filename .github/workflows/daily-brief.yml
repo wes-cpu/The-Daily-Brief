@@ -41,10 +41,11 @@ jobs:
           GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SCOULAR_COOKIES: ${{ secrets.SCOULAR_COOKIES }}
           SCOULAR_USER: ${{ secrets.SCOULAR_USER }}
           SCOULAR_PASS: ${{ secrets.SCOULAR_PASS }}
-          SCOULAR_EMAIL_USER: ${{ secrets.SCOULAR_EMAIL_USER }}
-          SCOULAR_EMAIL_PASS: ${{ secrets.SCOULAR_EMAIL_PASS }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Commit and push bid history CSV
         if: always()

@@ -399,12 +399,25 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                             "change": None,
                         })
 
+        # ── Capture fresh cookies for auto-rotation ───────────────────────────
+        # After a successful page visit the server may have issued refreshed
+        # session cookies (sliding expiry).  We capture them so the orchestrator
+        # can write them back to the GitHub secret, keeping the session alive
+        # indefinitely without any manual intervention.
+        fresh_cookies: list[dict] = []
+        if bids:
+            try:
+                fresh_cookies = await context.cookies(["https://scoularview.com"])
+                logger.info(f"{elevator_name}: captured {len(fresh_cookies)} fresh cookies for rotation")
+            except Exception as exc:
+                logger.debug(f"{elevator_name}: could not capture fresh cookies: {exc}")
+
         logger.info(f"{elevator_name}: extracted {len(bids)} bids")
-        return bids
+        return bids, fresh_cookies
 
     except Exception as exc:
         logger.error(f"{elevator_name}: error — {exc}", exc_info=True)
-        return []
+        return [], []
     finally:
         await page.close()
 
@@ -946,16 +959,17 @@ async def scrape_cgb(context: BrowserContext) -> list[dict]:
 # Master scraping function
 # ---------------------------------------------------------------------------
 
-async def fetch_all_elevator_bids() -> dict[str, list[dict]]:
+async def fetch_all_elevator_bids() -> tuple[dict[str, list[dict]], list[dict]]:
     """
-    Run all elevator scrapers concurrently and return results keyed by elevator name.
+    Run all elevator scrapers concurrently.
 
     Returns:
-        {
-            "Scoular CBLOC": [...],
-            "Cargill East St. Louis": [...],
-            ...
-        }
+        (bids_by_elevator, scoular_fresh_cookies)
+
+        bids_by_elevator  — dict keyed by elevator name, value is list of bid dicts
+        scoular_fresh_cookies — cookies captured after a successful Scoular login,
+                                ready to be written back to SCOULAR_COOKIES secret;
+                                empty list if Scoular was skipped or failed
     """
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -965,9 +979,8 @@ async def fetch_all_elevator_bids() -> dict[str, list[dict]]:
             locale="en-US",
         )
 
-        # Run all scrapers concurrently
-        tasks = {
-            "Scoular CBLOC": scrape_scoular_cbloc(context),
+        # Scoular is run separately (returns a tuple); all others return list[dict]
+        non_scoular_tasks = {
             "Cargill East St. Louis": scrape_cargill_east_st_louis(context),
             "Bunge Fairmount City": scrape_bunge_fairmount_city(context),
             "Bartlett Jacksonville": scrape_bartlett_jacksonville(context),
@@ -979,13 +992,29 @@ async def fetch_all_elevator_bids() -> dict[str, list[dict]]:
             "CGB": scrape_cgb(context),
         }
 
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        scoular_task = scrape_scoular_cbloc(context)
+
+        scoular_result, *other_results = await asyncio.gather(
+            scoular_task,
+            *non_scoular_tasks.values(),
+            return_exceptions=True,
+        )
 
         await context.close()
         await browser.close()
 
-    output = {}
-    for name, result in zip(tasks.keys(), results):
+    # Unpack Scoular (bids, fresh_cookies)
+    output: dict[str, list[dict]] = {}
+    scoular_fresh_cookies: list[dict] = []
+    if isinstance(scoular_result, Exception):
+        logger.error(f"Scoular CBLOC: unhandled exception: {scoular_result}")
+        output["Scoular CBLOC"] = []
+    else:
+        scoular_bids, scoular_fresh_cookies = scoular_result
+        output["Scoular CBLOC"] = scoular_bids
+
+    # Unpack remaining elevators
+    for name, result in zip(non_scoular_tasks.keys(), other_results):
         if isinstance(result, Exception):
             logger.error(f"{name}: unhandled exception: {result}")
             output[name] = []
@@ -994,4 +1023,4 @@ async def fetch_all_elevator_bids() -> dict[str, list[dict]]:
 
     total_bids = sum(len(v) for v in output.values())
     logger.info(f"Elevator scraping complete: {total_bids} total bids from {len(output)} elevators")
-    return output
+    return output, scoular_fresh_cookies
