@@ -8,10 +8,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
-from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator
 
 logger = logging.getLogger(__name__)
 
@@ -123,20 +122,23 @@ def fetch_continuous_price(commodity: str) -> Optional[dict]:
         daily_change = latest_close - prev_close
         daily_change_pct = (daily_change / prev_close) * 100 if prev_close != 0 else 0.0
 
-        # RSI (14-period)
-        rsi_ind = RSIIndicator(close=close, window=14)
-        rsi_series = rsi_ind.rsi()
+        # RSI (14-period) — Wilder smoothing via ewm
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi_series = 100 - (100 / (1 + rs))
         rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty else None
 
-        # 14-day MA
-        sma14_ind = SMAIndicator(close=close, window=14)
-        sma14_series = sma14_ind.sma_indicator()
+        # 14-day SMA
+        sma14_series = close.rolling(window=14).mean()
         ma14 = float(sma14_series.iloc[-1]) if not sma14_series.empty else None
 
-        # 200-day MA
+        # 200-day SMA
         if len(close) >= 200:
-            sma200_ind = SMAIndicator(close=close, window=200)
-            sma200_series = sma200_ind.sma_indicator()
+            sma200_series = close.rolling(window=200).mean()
             ma200 = float(sma200_series.iloc[-1]) if not sma200_series.empty else None
         else:
             logger.warning(f"Only {len(close)} trading days of data for {symbol}; skipping 200-MA")
