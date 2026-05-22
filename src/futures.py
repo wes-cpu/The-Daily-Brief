@@ -22,11 +22,12 @@ CONTINUOUS_SYMBOLS = {
     "wheat": "ZW=F",
 }
 
-# Deferred contract symbols: (commodity, month_code, description)
-# We'll dynamically determine the year suffix based on today's date
+# Deferred contract symbols tracked alongside the front month.
+# Corn/wheat use September + December to avoid overlap with July front month.
+# Soybeans use August + November (new crop); November is the key new-crop contract.
 DEFERRED_CONFIGS = {
     "corn": [
-        {"month_code": "N", "month_name": "July"},
+        {"month_code": "U", "month_name": "September"},
         {"month_code": "Z", "month_name": "December"},
     ],
     "soybeans": [
@@ -34,7 +35,7 @@ DEFERRED_CONFIGS = {
         {"month_code": "X", "month_name": "November"},
     ],
     "wheat": [
-        {"month_code": "N", "month_name": "July"},
+        {"month_code": "U", "month_name": "September"},
         {"month_code": "Z", "month_name": "December"},
     ],
 }
