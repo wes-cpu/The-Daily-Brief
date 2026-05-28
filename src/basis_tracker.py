@@ -239,6 +239,124 @@ def get_basis_trend(elevator: str, commodity: str) -> dict:
     return result
 
 
+def get_elevator_spread_changes(all_bids: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """
+    For each elevator, compute today's cash bid spread between front-month and each
+    deferred delivery period, and compare to the most recent prior day on record.
+
+    Returns:
+        { "Elevator Name": [
+            {
+                "commodity": str,
+                "front_period": str,
+                "deferred_period": str,
+                "current_spread": float or None,   # deferred - front ($/bu)
+                "prior_spread": float or None,
+                "spread_change": float or None,
+                "direction": "widened" / "narrowed" / "unchanged" / "N/A",
+            },
+            ...
+          ]
+        }
+    """
+    result: dict[str, list[dict]] = {}
+
+    try:
+        df = _load_history()
+        today = date.today()
+        today_ts = pd.Timestamp(today)
+
+        # Most recent prior day in CSV
+        prior_date_ts: Optional[pd.Timestamp] = None
+        if not df.empty:
+            prior_dates = (
+                df[df["date"].dt.normalize() < today_ts]["date"]
+                .dt.normalize()
+                .unique()
+            )
+            if len(prior_dates) > 0:
+                prior_date_ts = max(prior_dates)
+
+        for elevator_name, bids in all_bids.items():
+            elevator_spreads: list[dict] = []
+
+            # Group by commodity, preserving scraper order (front month first)
+            commodities: dict[str, list[dict]] = {}
+            for bid in bids:
+                commodity = bid.get("commodity", "Unknown")
+                if commodity not in commodities:
+                    commodities[commodity] = []
+                commodities[commodity].append(bid)
+
+            for commodity, cbids in commodities.items():
+                valid = [b for b in cbids if b.get("cash_price") is not None]
+                if len(valid) < 2:
+                    continue  # need at least front + one deferred
+
+                front_bid = valid[0]
+                front_price = float(front_bid["cash_price"])
+                front_period = front_bid.get("delivery_period", "")
+
+                for deferred_bid in valid[1:]:
+                    deferred_price = float(deferred_bid["cash_price"])
+                    deferred_period = deferred_bid.get("delivery_period", "")
+                    current_spread = deferred_price - front_price
+
+                    # Look up prior-day spread for same elevator/commodity
+                    prior_spread: Optional[float] = None
+                    spread_change: Optional[float] = None
+                    direction = "N/A"
+
+                    if prior_date_ts is not None and not df.empty:
+                        prior_mask = (
+                            (df["date"].dt.normalize() == prior_date_ts)
+                            & (df["elevator"] == elevator_name)
+                            & (df["commodity"].str.lower().str.contains(
+                                commodity.lower(), na=False
+                            ))
+                        )
+                        prior_rows = (
+                            df[prior_mask]
+                            .dropna(subset=["cash_price"])
+                            .to_dict("records")
+                        )
+                        if len(prior_rows) >= 2:
+                            pf_price = float(prior_rows[0]["cash_price"])
+                            # Match same deferred period, or fall back to same position
+                            match = next(
+                                (r for r in prior_rows[1:] if r.get("delivery_period") == deferred_period),
+                                prior_rows[1] if len(prior_rows) > 1 else None,
+                            )
+                            if match is not None:
+                                pd_price = float(match["cash_price"])
+                                prior_spread = pd_price - pf_price
+                                spread_change = current_spread - prior_spread
+                                if abs(spread_change) < 0.005:
+                                    direction = "unchanged"
+                                elif spread_change > 0:
+                                    direction = "widened"
+                                else:
+                                    direction = "narrowed"
+
+                    elevator_spreads.append({
+                        "commodity": commodity,
+                        "front_period": front_period,
+                        "deferred_period": deferred_period,
+                        "current_spread": current_spread,
+                        "prior_spread": prior_spread,
+                        "spread_change": spread_change,
+                        "direction": direction,
+                    })
+
+            if elevator_spreads:
+                result[elevator_name] = elevator_spreads
+
+    except Exception as e:
+        logger.error(f"get_elevator_spread_changes error: {e}", exc_info=True)
+
+    return result
+
+
 def get_all_basis_trends(all_bids: dict[str, list[dict]]) -> dict[str, dict]:
     """
     Compute basis trends for all elevators and commodities found in today's bids.

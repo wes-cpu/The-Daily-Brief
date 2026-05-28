@@ -108,17 +108,21 @@ def main() -> None:
         logger.warning("No bids to save to CSV")
 
     # ------------------------------------------------------------------
-    # Step 4: Compute basis trends
+    # Step 4: Compute basis trends and elevator spreads
     # ------------------------------------------------------------------
-    logger.info("--- Step 4: Computing basis trends ---")
+    logger.info("--- Step 4: Computing basis trends and elevator spreads ---")
     basis_trends: dict[str, dict] = {}
+    elevator_spreads: dict[str, list] = {}
     try:
-        from src.basis_tracker import get_all_basis_trends
+        from src.basis_tracker import get_all_basis_trends, get_elevator_spread_changes
         basis_trends = get_all_basis_trends(elevator_bids)
         logger.info(f"Computed basis trends for {len(basis_trends)} elevator/commodity combinations")
+        elevator_spreads = get_elevator_spread_changes(elevator_bids)
+        spread_count = sum(len(v) for v in elevator_spreads.values())
+        logger.info(f"Computed {spread_count} elevator front/deferred spread records")
     except Exception as e:
-        logger.error(f"Basis trend computation failed: {e}", exc_info=True)
-        logger.warning("Continuing without basis trends")
+        logger.error(f"Basis trend/spread computation failed: {e}", exc_info=True)
+        logger.warning("Continuing without basis trends/spreads")
 
     # ------------------------------------------------------------------
     # Step 5: Build HTML email
@@ -131,6 +135,7 @@ def main() -> None:
             futures_data=futures_data,
             elevator_bids=elevator_bids,
             basis_trends=basis_trends,
+            elevator_spreads=elevator_spreads,
             report_date=report_date,
         )
         logger.info(f"HTML email built ({len(html_body):,} bytes)")

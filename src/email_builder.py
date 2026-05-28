@@ -75,6 +75,25 @@ def _change_color(change: Optional[float]) -> str:
     return COLOR_POSITIVE if change >= 0 else COLOR_NEGATIVE
 
 
+def _spread_badge(direction: str) -> str:
+    """Return an HTML badge for elevator spread direction change."""
+    styles = {
+        "widened": "background:#dbeafe;color:#1d4ed8;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;",
+        "narrowed": "background:#fef3c7;color:#92400e;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;",
+        "unchanged": "background:#f3f4f6;color:#6b7280;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;",
+        "N/A": "background:#f3f4f6;color:#9ca3af;padding:2px 6px;border-radius:4px;font-size:11px;",
+    }
+    labels = {
+        "widened": "↑ Widened",
+        "narrowed": "↓ Narrowed",
+        "unchanged": "→ Unchanged",
+        "N/A": "N/A",
+    }
+    style = styles.get(direction, styles["N/A"])
+    label = labels.get(direction, direction)
+    return f'<span style="{style}">{label}</span>'
+
+
 def _trend_badge(trend: str) -> str:
     """Return an HTML badge/span for a trend direction."""
     styles = {
@@ -130,6 +149,7 @@ def build_email(
     futures_data: dict,
     elevator_bids: dict[str, list[dict]],
     basis_trends: dict[str, dict],
+    elevator_spreads: Optional[dict] = None,
     report_date: Optional[date] = None,
 ) -> str:
     """
@@ -168,6 +188,7 @@ def build_email(
     html_technicals = _build_technicals_table(front_month)
     html_elevator_bids = _build_elevator_bids_section(elevator_bids)
     html_basis_trends = _build_basis_trends_section(basis_trends, elevator_bids)
+    html_elevator_spreads = _build_elevator_spread_section(elevator_spreads or {})
     html_warnings = _build_warnings(failed_elevators)
 
     # -----------------------------------------------------------------------
@@ -269,6 +290,19 @@ def build_email(
         Basis Trends
       </h2>
       {html_basis_trends}
+
+      <!-- Elevator Front/Deferred Spread Analysis -->
+      <h2 style="font-size:15px;font-weight:700;color:{COLOR_PRIMARY};
+                 border-bottom:2px solid {COLOR_PRIMARY};padding-bottom:6px;
+                 margin:24px 0 12px 0;font-family:Arial,sans-serif;">
+        Elevator Front/Deferred Cash Bid Spreads
+      </h2>
+      <p style="color:#6b7280;font-size:12px;margin:0 0 8px 0;">
+        Spread = deferred delivery price − front month price ($/bu).
+        Positive = carry market; negative = inverse market.
+        Change vs prior trading day shown where history exists.
+      </p>
+      {html_elevator_spreads}
 
     </td>
   </tr>
@@ -691,6 +725,106 @@ def _build_basis_trends_section(
           <th style="{_th_style()}">1-Wk Trend</th>
           <th style="{_th_style()}">2-Wk Trend</th>
           <th style="{_th_style()}">1-Mo Trend</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_html}
+      </tbody>
+    </table>"""
+
+
+def _build_elevator_spread_section(spread_data: dict[str, list[dict]]) -> str:
+    """Build the elevator front/deferred cash bid spread table."""
+    if not spread_data:
+        return (
+            "<p style='color:#9ca3af;font-size:13px;'>"
+            "No spread data available — elevators may only post one delivery month, "
+            "or this is the first run (no prior day for comparison)."
+            "</p>"
+        )
+
+    rows_html = ""
+    row_idx = 0
+    elevator_order = [
+        "Scoular CBLOC",
+        "Cargill East St. Louis",
+        "Bunge Fairmount City",
+        "Bartlett Jacksonville",
+        "ADM Decatur Soy",
+        "ADM Decatur Corn",
+        "ADM Sauget",
+        "CHS Illinois",
+        "GPRe Madison",
+        "CGB",
+    ]
+    ordered = [n for n in elevator_order if n in spread_data]
+    extras = sorted(n for n in spread_data if n not in elevator_order)
+
+    for elevator_name in ordered + extras:
+        spreads = spread_data[elevator_name]
+        for spread in spreads:
+            alt = row_idx % 2 == 1
+            commodity = spread.get("commodity", "")
+            front_period = spread.get("front_period", "") or "—"
+            deferred_period = spread.get("deferred_period", "") or "—"
+            current_spread = spread.get("current_spread")
+            prior_spread = spread.get("prior_spread")
+            spread_change = spread.get("spread_change")
+            direction = spread.get("direction", "N/A")
+
+            if current_spread is not None:
+                sign = "+" if current_spread >= 0 else ""
+                spread_str = f"{sign}{current_spread:.2f}"
+                spread_color = COLOR_POSITIVE if current_spread >= 0 else COLOR_NEGATIVE
+            else:
+                spread_str = "N/A"
+                spread_color = COLOR_NEUTRAL
+
+            if prior_spread is not None:
+                sign = "+" if prior_spread >= 0 else ""
+                prior_str = f"{sign}{prior_spread:.2f}"
+            else:
+                prior_str = "—"
+
+            if spread_change is not None:
+                sign = "+" if spread_change >= 0 else ""
+                change_str = f"{sign}{spread_change:.2f}"
+                change_color = (
+                    COLOR_POSITIVE if spread_change > 0
+                    else (COLOR_NEGATIVE if spread_change < 0 else COLOR_NEUTRAL)
+                )
+            else:
+                change_str = "—"
+                change_color = COLOR_NEUTRAL
+
+            rows_html += f"""
+        <tr>
+          <td style="{_td_style(alt)};font-size:12px;">{elevator_name}</td>
+          <td style="{_td_style(alt)};font-size:12px;">{commodity}</td>
+          <td style="{_td_style(alt)};font-size:12px;">{front_period}</td>
+          <td style="{_td_style(alt)};font-size:12px;">{deferred_period}</td>
+          <td style="{_td_style(alt)};color:{spread_color};font-weight:600;">{spread_str}</td>
+          <td style="{_td_style(alt)};color:#6b7280;">{prior_str}</td>
+          <td style="{_td_style(alt)};color:{change_color};">{change_str}</td>
+          <td style="{_td_style(alt)}">{_spread_badge(direction)}</td>
+        </tr>"""
+            row_idx += 1
+
+    if not rows_html:
+        return "<p style='color:#9ca3af;font-size:13px;'>No elevator spread data available.</p>"
+
+    return f"""
+    <table style="{_table_style()}font-size:12px;">
+      <thead>
+        <tr>
+          <th style="{_th_style()}">Elevator</th>
+          <th style="{_th_style()}">Commodity</th>
+          <th style="{_th_style()}">Front Month</th>
+          <th style="{_th_style()}">Deferred</th>
+          <th style="{_th_style()}">Spread ($/bu)</th>
+          <th style="{_th_style()}">Prior Day</th>
+          <th style="{_th_style()}">Change</th>
+          <th style="{_th_style()}">Direction</th>
         </tr>
       </thead>
       <tbody>

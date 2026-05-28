@@ -26,7 +26,7 @@ CONTINUOUS_SYMBOLS = {
 # We'll dynamically determine the year suffix based on today's date
 DEFERRED_CONFIGS = {
     "corn": [
-        {"month_code": "N", "month_name": "July"},
+        {"month_code": "U", "month_name": "September"},
         {"month_code": "Z", "month_name": "December"},
     ],
     "soybeans": [
@@ -34,7 +34,7 @@ DEFERRED_CONFIGS = {
         {"month_code": "X", "month_name": "November"},
     ],
     "wheat": [
-        {"month_code": "N", "month_name": "July"},
+        {"month_code": "U", "month_name": "September"},
         {"month_code": "Z", "month_name": "December"},
     ],
 }
