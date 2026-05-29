@@ -149,6 +149,7 @@ def fetch_continuous_price(commodity: str) -> Optional[dict]:
             "name": name,
             "commodity": commodity,
             "price": latest_close,
+            "prev_close": prev_close,
             "change": daily_change,
             "change_pct": daily_change_pct,
             "rsi14": rsi14,
@@ -162,12 +163,17 @@ def fetch_continuous_price(commodity: str) -> Optional[dict]:
         return None
 
 
-def fetch_deferred_contracts(commodity: str, front_month_price: float) -> list[dict]:
+def fetch_deferred_contracts(
+    commodity: str,
+    front_month_price: float,
+    prev_front_month_price: Optional[float] = None,
+) -> list[dict]:
     """
     Fetch deferred contract prices and calculate spreads vs front month.
 
     Returns list of dicts with:
-        ticker, name, price, spread (deferred - front_month)
+        ticker, name, price, spread, spread_change, spread_direction
+    spread_change = today's spread minus yesterday's spread (positive = widening).
     """
     configs = DEFERRED_CONFIGS.get(commodity, [])
     results = []
@@ -180,7 +186,6 @@ def fetch_deferred_contracts(commodity: str, front_month_price: float) -> list[d
         try:
             logger.info(f"Fetching deferred contract {contract_name} ({ticker})")
             t = yf.Ticker(ticker)
-            # Just need recent price
             hist = t.history(period="5d")
 
             if hist.empty:
@@ -191,6 +196,20 @@ def fetch_deferred_contracts(commodity: str, front_month_price: float) -> list[d
             price = float(hist["Close"].iloc[-1])
             spread = price - front_month_price
 
+            # Day-over-day spread change
+            spread_change: Optional[float] = None
+            spread_direction = "N/A"
+            if len(hist) >= 2 and prev_front_month_price is not None:
+                prev_deferred_price = float(hist["Close"].iloc[-2])
+                prev_spread = prev_deferred_price - prev_front_month_price
+                spread_change = spread - prev_spread
+                if abs(spread_change) < 0.001:
+                    spread_direction = "unchanged"
+                elif spread_change > 0:
+                    spread_direction = "widening"
+                else:
+                    spread_direction = "narrowing"
+
             results.append({
                 "ticker": ticker,
                 "contract_name": contract_name,
@@ -198,6 +217,8 @@ def fetch_deferred_contracts(commodity: str, front_month_price: float) -> list[d
                 "commodity": commodity,
                 "price": price,
                 "spread": spread,
+                "spread_change": spread_change,
+                "spread_direction": spread_direction,
             })
 
         except Exception as e:
@@ -225,7 +246,9 @@ def fetch_all_futures() -> dict:
         front_month[commodity] = data
 
         if data is not None:
-            deferred[commodity] = fetch_deferred_contracts(commodity, data["price"])
+            deferred[commodity] = fetch_deferred_contracts(
+                commodity, data["price"], prev_front_month_price=data.get("prev_close")
+            )
         else:
             logger.warning(f"Skipping deferred contracts for {commodity} (no front-month data)")
             deferred[commodity] = []

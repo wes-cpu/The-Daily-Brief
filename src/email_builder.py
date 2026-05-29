@@ -76,7 +76,7 @@ def _change_color(change: Optional[float]) -> str:
 
 
 def _trend_badge(trend: str) -> str:
-    """Return an HTML badge/span for a trend direction."""
+    """Return an HTML badge/span for a basis trend direction."""
     styles = {
         "strengthening": f'background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;',
         "weakening": f'background:#fee2e2;color:#b91c1c;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;',
@@ -92,6 +92,18 @@ def _trend_badge(trend: str) -> str:
     }
     label = labels.get(trend, trend)
     return f'<span style="{style}">{label}</span>'
+
+
+def _spread_badge(direction: str, spread_change: Optional[float]) -> str:
+    """Return an HTML badge for spread change direction."""
+    if direction == "N/A" or spread_change is None:
+        return '<span style="background:#f3f4f6;color:#9ca3af;padding:2px 6px;border-radius:4px;font-size:11px;">N/A</span>'
+    change_str = f"{spread_change:+.4f}"
+    if direction == "widening":
+        return f'<span style="background:#fee2e2;color:#b91c1c;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;">▲ Widening ({change_str})</span>'
+    if direction == "narrowing":
+        return f'<span style="background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;">▼ Narrowing ({change_str})</span>'
+    return f'<span style="background:#f3f4f6;color:#6b7280;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;">→ Unchanged ({change_str})</span>'
 
 
 def _section_header(title: str) -> str:
@@ -401,7 +413,7 @@ def _build_futures_table(front_month: dict) -> str:
 
 
 def _build_deferred_table(deferred: dict) -> str:
-    """Build the deferred contracts spread table."""
+    """Build the deferred contracts spread table with day-over-day spread change."""
     rows_html = ""
     row_idx = 0
     commodity_emojis = {"corn": "🌽", "soybeans": "🫘", "wheat": "🌾"}
@@ -413,7 +425,7 @@ def _build_deferred_table(deferred: dict) -> str:
             rows_html += f"""
         <tr>
           <td style="{_td_style(alt)}">{commodity_emojis.get(commodity,'')} {commodity.title()}</td>
-          <td style="{_td_style(alt)}" colspan="4">No deferred data</td>
+          <td style="{_td_style(alt)}" colspan="5">No deferred data</td>
         </tr>"""
             row_idx += 1
             continue
@@ -424,6 +436,10 @@ def _build_deferred_table(deferred: dict) -> str:
             spread_color = _change_color(spread)
             spread_str = _fmt_change(spread) if spread is not None else "N/A"
             price = _fmt_price(contract.get("price"), 4)
+            spread_badge = _spread_badge(
+                contract.get("spread_direction", "N/A"),
+                contract.get("spread_change"),
+            )
 
             rows_html += f"""
         <tr>
@@ -432,6 +448,7 @@ def _build_deferred_table(deferred: dict) -> str:
           <td style="{_td_style(alt)};">{contract.get('month_name','')}</td>
           <td style="{_td_style(alt)};font-weight:600;">{price}</td>
           <td style="{_td_style(alt)};color:{spread_color};font-weight:600;">{spread_str}</td>
+          <td style="{_td_style(alt)};">{spread_badge}</td>
         </tr>"""
             row_idx += 1
 
@@ -447,6 +464,7 @@ def _build_deferred_table(deferred: dict) -> str:
           <th style="{_th_style()}">Month</th>
           <th style="{_th_style()}">Price ($/bu)</th>
           <th style="{_th_style()}">Spread vs Front</th>
+          <th style="{_th_style()}">Spread Change (DoD)</th>
         </tr>
       </thead>
       <tbody>

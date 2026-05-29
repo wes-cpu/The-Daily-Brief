@@ -374,7 +374,7 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                     f"{elevator_name}: MFA prompt detected — run get_scoular_cookies.py locally, "
                     "log in with the security code, and store the output as SCOULAR_COOKIES"
                 )
-                return []
+                return [], []
 
             if url not in page.url:
                 await page.goto(url, wait_until="networkidle", timeout=60_000)
