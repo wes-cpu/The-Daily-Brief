@@ -79,10 +79,17 @@ def _select_deferred_contracts(commodity: str, n: int = 2) -> list[dict]:
             if sort_key < ref_key:
                 continue
             year_suffix = str(year)[-2:]
+            # Yahoo Finance accepts two formats for dated CBOT futures:
+            #   ZCN26=F  (short year, =F suffix)  ← sometimes 404s
+            #   ZCN26.CBT (CBOT exchange suffix)   ← more reliable
+            # We try both; fetch_deferred_contracts tries the list in order.
             candidates.append({
                 "month_code": code,
                 "month_name": f"{name} {year}",
-                "ticker": f"{prefix}{code}{year_suffix}=F",
+                "tickers": [
+                    f"{prefix}{code}{year_suffix}.CBT",
+                    f"{prefix}{code}{year_suffix}=F",
+                ],
                 "contract_name": f"{prefix}{code}{year}",
                 "commodity": commodity,
                 "sort_key": sort_key,
@@ -191,34 +198,37 @@ def fetch_deferred_contracts(commodity: str, front_month_price: float) -> list[d
     results = []
 
     for cfg in contracts:
-        ticker = cfg["ticker"]
+        tickers = cfg["tickers"]
         contract_name = cfg["contract_name"]
         month_name = cfg["month_name"]
 
-        try:
-            logger.info(f"Fetching deferred contract {contract_name} ({ticker})")
-            t = yf.Ticker(ticker)
-            hist = t.history(period="5d")
+        price = None
+        used_ticker = None
+        for ticker in tickers:
+            try:
+                logger.info(f"Fetching deferred contract {contract_name} ({ticker})")
+                hist = yf.Ticker(ticker).history(period="5d")
+                if not hist.empty:
+                    hist = hist.sort_index()
+                    price = float(hist["Close"].iloc[-1])
+                    used_ticker = ticker
+                    break
+            except Exception as e:
+                logger.debug(f"Deferred {ticker} failed: {e}")
 
-            if hist.empty:
-                logger.warning(f"No data for deferred contract {ticker}")
-                continue
+        if price is None:
+            logger.warning(f"No data found for deferred contract {contract_name} (tried {tickers})")
+            continue
 
-            hist = hist.sort_index()
-            price = float(hist["Close"].iloc[-1])
-            spread = price - front_month_price
-
-            results.append({
-                "ticker": ticker,
-                "contract_name": contract_name,
-                "month_name": month_name,
-                "commodity": commodity,
-                "price": price,
-                "spread": spread,
-            })
-
-        except Exception as e:
-            logger.error(f"Error fetching deferred contract {ticker}: {e}", exc_info=True)
+        spread = price - front_month_price
+        results.append({
+            "ticker": used_ticker,
+            "contract_name": contract_name,
+            "month_name": month_name,
+            "commodity": commodity,
+            "price": price,
+            "spread": spread,
+        })
 
     return results
 
