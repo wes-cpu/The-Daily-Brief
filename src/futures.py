@@ -1,17 +1,17 @@
 """
 futures.py - Fetches CBOT futures prices and technical indicators.
 
-Uses yfinance for continuous front-month prices and ta for RSI/MA.
+Uses yfinance for continuous front-month prices; RSI and SMA computed
+with pure pandas/numpy (no C-extension dependency).
 """
 
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
-from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator
 
 logger = logging.getLogger(__name__)
 
@@ -22,21 +22,13 @@ CONTINUOUS_SYMBOLS = {
     "wheat": "ZW=F",
 }
 
-# Deferred contract symbols: (commodity, month_code, description)
-# We'll dynamically determine the year suffix based on today's date
-DEFERRED_CONFIGS = {
-    "corn": [
-        {"month_code": "N", "month_name": "July"},
-        {"month_code": "Z", "month_name": "December"},
-    ],
-    "soybeans": [
-        {"month_code": "Q", "month_name": "August"},
-        {"month_code": "X", "month_name": "November"},
-    ],
-    "wheat": [
-        {"month_code": "N", "month_name": "July"},
-        {"month_code": "Z", "month_name": "December"},
-    ],
+# All listed contract months per commodity (code, name, calendar-month-number)
+# Used to dynamically select genuinely deferred contracts (not the front month).
+ALL_CONTRACT_MONTHS: dict[str, list[tuple[str, str, int]]] = {
+    "corn":     [("H","March",3),("K","May",5),("N","July",7),("U","September",9),("Z","December",12)],
+    "soybeans": [("F","January",1),("H","March",3),("K","May",5),("N","July",7),
+                 ("Q","August",8),("U","September",9),("X","November",11)],
+    "wheat":    [("H","March",3),("K","May",5),("N","July",7),("U","September",9),("Z","December",12)],
 }
 
 # Month codes to month numbers for date logic
@@ -45,7 +37,7 @@ MONTH_CODE_MAP = {
     "G": 2,   # February
     "H": 3,   # March
     "K": 5,   # May
-    "M": 6,   # June (not used but common)
+    "M": 6,   # June
     "N": 7,   # July
     "Q": 8,   # August
     "U": 9,   # September
@@ -60,39 +52,67 @@ COMMODITY_NAMES = {
     "wheat": "Wheat",
 }
 
+TICKER_PREFIX = {"corn": "ZC", "soybeans": "ZS", "wheat": "ZW"}
 
-def _get_deferred_year(month_code: str) -> int:
-    """Determine the appropriate contract year for a deferred month code."""
+
+def _select_deferred_contracts(commodity: str, n: int = 2) -> list[dict]:
+    """
+    Return the n nearest contract months that are genuinely deferred
+    (at least 2 calendar months after today).  This avoids returning the
+    front-month contract as a "deferred" position (e.g., picking July when
+    July IS the current front month in June).
+    """
     today = datetime.today()
-    contract_month = MONTH_CODE_MAP.get(month_code, 7)
-    year = today.year
-    # If the contract month has already passed this year, use next year
-    if contract_month <= today.month:
-        year += 1
-    return year
+    threshold_month = today.month + 2  # need at least 2 months out
+    threshold_year = today.year
+    if threshold_month > 12:
+        threshold_month -= 12
+        threshold_year += 1
+
+    prefix = TICKER_PREFIX[commodity]
+    candidates: list[dict] = []
+
+    for year in [today.year, today.year + 1, today.year + 2]:
+        for code, name, month_num in ALL_CONTRACT_MONTHS[commodity]:
+            sort_key = year * 100 + month_num
+            ref_key = threshold_year * 100 + threshold_month
+            if sort_key < ref_key:
+                continue
+            year_suffix = str(year)[-2:]
+            candidates.append({
+                "month_code": code,
+                "month_name": f"{name} {year}",
+                "ticker": f"{prefix}{code}{year_suffix}=F",
+                "contract_name": f"{prefix}{code}{year}",
+                "commodity": commodity,
+                "sort_key": sort_key,
+            })
+
+    candidates.sort(key=lambda x: x["sort_key"])
+    return candidates[:n]
 
 
-def _build_deferred_ticker(commodity: str, month_code: str) -> tuple[str, str]:
-    """Build the yfinance ticker and human-readable name for a deferred contract."""
-    ticker_prefix = {
-        "corn": "ZC",
-        "soybeans": "ZS",
-        "wheat": "ZW",
-    }[commodity]
-    year = _get_deferred_year(month_code)
-    year_suffix = str(year)[-2:]  # e.g., "26" for 2026
-    ticker = f"{ticker_prefix}{month_code}{year_suffix}=F"
-    name = f"{ticker_prefix}{month_code}{year}"
-    return ticker, name
+def _rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    """Compute RSI using Wilder's smoothed moving average."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _sma(close: pd.Series, window: int) -> pd.Series:
+    return close.rolling(window=window, min_periods=window).mean()
 
 
 def fetch_continuous_price(commodity: str) -> Optional[dict]:
     """
     Fetch front-month continuous contract price and technical indicators.
 
-    Returns dict with:
-        symbol, name, price, change, change_pct,
-        rsi14, ma14, ma200
+    Returns dict with: symbol, name, price, change, change_pct,
+        rsi14, ma14, ma200, as_of_date
     """
     symbol = CONTINUOUS_SYMBOLS[commodity]
     name = COMMODITY_NAMES[commodity]
@@ -124,20 +144,17 @@ def fetch_continuous_price(commodity: str) -> Optional[dict]:
         daily_change_pct = (daily_change / prev_close) * 100 if prev_close != 0 else 0.0
 
         # RSI (14-period)
-        rsi_ind = RSIIndicator(close=close, window=14)
-        rsi_series = rsi_ind.rsi()
-        rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty else None
+        rsi_series = _rsi(close, window=14)
+        rsi14 = float(rsi_series.iloc[-1]) if not rsi_series.empty and pd.notna(rsi_series.iloc[-1]) else None
 
         # 14-day MA
-        sma14_ind = SMAIndicator(close=close, window=14)
-        sma14_series = sma14_ind.sma_indicator()
-        ma14 = float(sma14_series.iloc[-1]) if not sma14_series.empty else None
+        sma14_series = _sma(close, window=14)
+        ma14 = float(sma14_series.iloc[-1]) if not sma14_series.empty and pd.notna(sma14_series.iloc[-1]) else None
 
         # 200-day MA
         if len(close) >= 200:
-            sma200_ind = SMAIndicator(close=close, window=200)
-            sma200_series = sma200_ind.sma_indicator()
-            ma200 = float(sma200_series.iloc[-1]) if not sma200_series.empty else None
+            sma200_series = _sma(close, window=200)
+            ma200 = float(sma200_series.iloc[-1]) if not sma200_series.empty and pd.notna(sma200_series.iloc[-1]) else None
         else:
             logger.warning(f"Only {len(close)} trading days of data for {symbol}; skipping 200-MA")
             ma200 = None
@@ -164,23 +181,23 @@ def fetch_continuous_price(commodity: str) -> Optional[dict]:
 
 def fetch_deferred_contracts(commodity: str, front_month_price: float) -> list[dict]:
     """
-    Fetch deferred contract prices and calculate spreads vs front month.
+    Fetch the 2 nearest genuinely-deferred contract prices and calculate
+    spreads vs the front month.
 
     Returns list of dicts with:
-        ticker, name, price, spread (deferred - front_month)
+        ticker, contract_name, month_name, commodity, price, spread
     """
-    configs = DEFERRED_CONFIGS.get(commodity, [])
+    contracts = _select_deferred_contracts(commodity, n=2)
     results = []
 
-    for cfg in configs:
-        month_code = cfg["month_code"]
+    for cfg in contracts:
+        ticker = cfg["ticker"]
+        contract_name = cfg["contract_name"]
         month_name = cfg["month_name"]
-        ticker, contract_name = _build_deferred_ticker(commodity, month_code)
 
         try:
             logger.info(f"Fetching deferred contract {contract_name} ({ticker})")
             t = yf.Ticker(ticker)
-            # Just need recent price
             hist = t.history(period="5d")
 
             if hist.empty:
