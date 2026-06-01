@@ -157,34 +157,52 @@ async def _fetch_barchart_bids(
     captured_bids: list[dict] = []
     api_captured = False
 
+    # Barchart WebSol cash-bid APIs use several URL patterns depending on the
+    # widget version.  Widen the net to catch all of them.
+    BARCHART_PATTERNS = (
+        "getCashBids",
+        "cash_bids",
+        "cashbids",
+        "websol.barchart.com",
+        "ondemand.barchart.com",
+        "www-api.barchart.com",
+        "/v2/cashbids",
+        "/v2/cash-bids",
+    )
+
     async def handle_response(response):
         nonlocal api_captured
         try:
-            if "getCashBids" in response.url or "cash_bids" in response.url.lower():
-                body = await response.json()
-                api_captured = True
-                # Barchart API structure varies; try common shapes
-                bids_data = (
-                    body.get("data", {}).get("cashBids", [])
-                    or body.get("cashBids", [])
-                    or body.get("results", [])
-                    or body.get("data", [])
-                )
-                if isinstance(bids_data, list):
-                    for item in bids_data:
-                        commodity = (
-                            item.get("commodity", item.get("name", "Unknown"))
-                            .strip()
-                        )
-                        captured_bids.append({
-                            "elevator": elevator_name,
-                            "commodity": commodity,
-                            "delivery_period": item.get("expirationDate", item.get("deliveryPeriod", "")),
-                            "cash_price": _parse_price(str(item.get("cashPrice", item.get("price", "")))),
-                            "basis": _parse_basis(str(item.get("basis", ""))),
-                            "futures_reference": item.get("futuresCode", item.get("contractCode", "")),
-                            "change": _parse_price(str(item.get("netChange", item.get("change", "")))),
-                        })
+            rurl = response.url
+            if not any(pat.lower() in rurl.lower() for pat in BARCHART_PATTERNS):
+                return
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            body = await response.json()
+            api_captured = True
+            # Barchart API structure varies; try common shapes
+            bids_data = (
+                body.get("data", {}).get("cashBids", [])
+                or body.get("cashBids", [])
+                or body.get("results", [])
+                or (body.get("data", []) if isinstance(body.get("data"), list) else [])
+            )
+            if isinstance(bids_data, list):
+                for item in bids_data:
+                    commodity = (
+                        item.get("commodity", item.get("name", "Unknown"))
+                        .strip()
+                    )
+                    captured_bids.append({
+                        "elevator": elevator_name,
+                        "commodity": commodity,
+                        "delivery_period": item.get("expirationDate", item.get("deliveryPeriod", "")),
+                        "cash_price": _parse_price(str(item.get("cashPrice", item.get("price", "")))),
+                        "basis": _parse_basis(str(item.get("basis", ""))),
+                        "futures_reference": item.get("futuresCode", item.get("contractCode", "")),
+                        "change": _parse_price(str(item.get("netChange", item.get("change", "")))),
+                    })
         except Exception:
             pass
 
@@ -195,8 +213,24 @@ async def _fetch_barchart_bids(
     except Exception as e:
         logger.warning(f"{elevator_name}: navigation error: {e}")
 
-    # Give a moment for any delayed XHR
-    await asyncio.sleep(2)
+    # Barchart widgets fire their API call after networkidle — give extra time.
+    # Also try waiting for bid-table selectors to confirm the widget has rendered.
+    WIDGET_SELECTORS = [
+        "[class*='cash-bid']",
+        "[class*='cashbid']",
+        "[class*='CashBid']",
+        ".bc-cash-bids",
+        "[data-module='CashBids']",
+        "table tbody tr td",
+    ]
+    for sel in WIDGET_SELECTORS:
+        try:
+            await page.wait_for_selector(sel, timeout=8_000)
+            break
+        except Exception:
+            continue
+
+    await asyncio.sleep(4)
 
     if api_captured and captured_bids:
         logger.info(f"{elevator_name}: captured {len(captured_bids)} bids via API intercept")
@@ -307,11 +341,11 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
 
     if not cookies_json and not (username and password):
         logger.warning(f"{elevator_name}: no credentials configured (set SCOULAR_COOKIES); skipping")
-        return []
+        return [], []
 
     page = await _new_page(context, timeout=60_000)
     try:
-        # ── Method 1: inject saved session cookies ───────────────────────────
+        # ── Method 1: inject saved session cookies ───────────────────────────────────────
         if cookies_json:
             try:
                 cookies = json.loads(cookies_json)
@@ -319,7 +353,7 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                 logger.info(f"{elevator_name}: injected {len(cookies)} saved cookies")
             except (json.JSONDecodeError, Exception) as exc:
                 logger.error(f"{elevator_name}: failed to parse SCOULAR_COOKIES — {exc}")
-                return []
+                return [], []
 
             await page.goto(url, wait_until="networkidle", timeout=60_000)
 
@@ -336,7 +370,7 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
 
             logger.info(f"{elevator_name}: cookie login succeeded; on {page.url}")
 
-        # ── Method 2: username + password (no MFA support) ───────────────────
+        # ── Method 2: username + password (no MFA support) ─────────────────────
         else:
             logger.info(f"{elevator_name}: no cookies; attempting username/password login")
             await page.goto(url, wait_until="networkidle", timeout=60_000)
@@ -374,12 +408,12 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                     f"{elevator_name}: MFA prompt detected — run get_scoular_cookies.py locally, "
                     "log in with the security code, and store the output as SCOULAR_COOKIES"
                 )
-                return []
+                return [], []
 
             if url not in page.url:
                 await page.goto(url, wait_until="networkidle", timeout=60_000)
 
-        # ── Extract bids ─────────────────────────────────────────────────────
+        # ── Extract bids ───────────────────────────────────────────────────────────────────────
         bids = await _parse_barchart_html(page, elevator_name)
         if not bids:
             rows = await page.query_selector_all("tr, .bid-row, .market-row")
@@ -402,7 +436,7 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                             "change": None,
                         })
 
-        # ── Capture fresh cookies for auto-rotation ───────────────────────────
+        # ── Capture fresh cookies for auto-rotation ─────────────────────────────────
         # After a successful page visit the server may have issued refreshed
         # session cookies (sliding expiry).  We capture them so the orchestrator
         # can write them back to the GitHub secret, keeping the session alive
