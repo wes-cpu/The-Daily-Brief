@@ -130,6 +130,7 @@ def build_email(
     futures_data: dict,
     elevator_bids: dict[str, list[dict]],
     basis_trends: dict[str, dict],
+    elevator_spread_data: Optional[dict] = None,
     report_date: Optional[date] = None,
 ) -> str:
     """
@@ -139,6 +140,7 @@ def build_email(
         futures_data: return value of fetch_all_futures()
         elevator_bids: keyed by elevator name, list of bid dicts
         basis_trends: keyed by "ElevatorName|Commodity", trend dicts
+        elevator_spread_data: return value of get_elevator_spread_data()
         report_date: date for the report (defaults to today)
 
     Returns:
@@ -168,6 +170,7 @@ def build_email(
     html_technicals = _build_technicals_table(front_month)
     html_elevator_bids = _build_elevator_bids_section(elevator_bids)
     html_basis_trends = _build_basis_trends_section(basis_trends, elevator_bids)
+    html_elevator_spreads = _build_elevator_spread_changes_section(elevator_spread_data or {})
     html_warnings = _build_warnings(failed_elevators)
 
     # -----------------------------------------------------------------------
@@ -262,11 +265,23 @@ def build_email(
       </h2>
       {html_elevator_bids}
 
+      <!-- Elevator Deferred Spread Changes -->
+      <h2 style="font-size:15px;font-weight:700;color:{COLOR_PRIMARY};
+                 border-bottom:2px solid {COLOR_PRIMARY};padding-bottom:6px;
+                 margin:24px 0 12px 0;font-family:Arial,sans-serif;">
+        Elevator Deferred Spread Changes
+      </h2>
+      <p style="font-size:12px;color:#6b7280;margin:0 0 10px 0;font-family:Arial,sans-serif;">
+        Spread = deferred cash price minus front-month cash price.
+        A widening spread (positive change) means deferred months are gaining on front month.
+      </p>
+      {html_elevator_spreads}
+
       <!-- Basis Trends -->
       <h2 style="font-size:15px;font-weight:700;color:{COLOR_PRIMARY};
                  border-bottom:2px solid {COLOR_PRIMARY};padding-bottom:6px;
                  margin:24px 0 12px 0;font-family:Arial,sans-serif;">
-        Basis Trends
+        Basis Trends (Front Month)
       </h2>
       {html_basis_trends}
 
@@ -697,6 +712,125 @@ def _build_basis_trends_section(
         {rows_html}
       </tbody>
     </table>"""
+
+
+def _build_elevator_spread_changes_section(spread_data: dict[str, list[dict]]) -> str:
+    """Build per-elevator tables showing front-month vs deferred cash spread changes."""
+    if not spread_data:
+        return (
+            "<p style='color:#9ca3af;font-size:13px;'>"
+            "No spread data available (requires at least 2 delivery periods per elevator)."
+            "</p>"
+        )
+
+    elevator_order = [
+        "Scoular CBLOC", "Cargill East St. Louis", "Bunge Fairmount City",
+        "Bartlett Jacksonville", "ADM Decatur Soy", "ADM Decatur Corn",
+        "ADM Sauget", "CHS Illinois", "GPRe Madison", "CGB",
+    ]
+    ordered = [n for n in elevator_order if n in spread_data]
+    extras = sorted(n for n in spread_data if n not in elevator_order)
+
+    parts = []
+    for elevator_name in ordered + extras:
+        spreads = spread_data.get(elevator_name, [])
+        if not spreads:
+            continue
+
+        rows_html = ""
+        for i, s in enumerate(spreads):
+            alt = i % 2 == 1
+
+            cash_spread_today = s.get("cash_spread_today")
+            cash_spread_prev = s.get("cash_spread_prev")
+            cash_spread_change = s.get("cash_spread_change")
+            basis_spread_today = s.get("basis_spread_today")
+            basis_spread_change = s.get("basis_spread_change")
+
+            def _fmt_spread(val: Optional[float]) -> str:
+                if val is None:
+                    return "N/A"
+                sign = "+" if val >= 0 else ""
+                return f"{sign}${val:.3f}"
+
+            def _fmt_cents_spread(val: Optional[float]) -> str:
+                if val is None:
+                    return "N/A"
+                sign = "+" if val >= 0 else ""
+                # If value looks like dollars, convert to cents
+                if abs(val) < 2.0 and val != 0:
+                    val_c = val * 100
+                    return f"{sign}{val_c:.0f}¢"
+                return f"{sign}{val:.0f}¢"
+
+            # Cash spread change cell with color
+            if cash_spread_change is not None:
+                if abs(cash_spread_change) < 0.001:
+                    chg_color = COLOR_NEUTRAL
+                    chg_label = "→ unch"
+                elif cash_spread_change > 0:
+                    chg_color = COLOR_POSITIVE
+                    chg_label = f"▲ +${cash_spread_change:.3f}"
+                else:
+                    chg_color = COLOR_NEGATIVE
+                    chg_label = f"▼ ${cash_spread_change:.3f}"
+                chg_cell = f'<span style="color:{chg_color};font-weight:600;">{chg_label}</span>'
+            else:
+                chg_cell = '<span style="color:#9ca3af;font-size:11px;">first day</span>'
+
+            # Basis spread change (secondary info)
+            if basis_spread_change is not None and abs(basis_spread_change) >= 0.5:
+                b_sign = "+" if basis_spread_change >= 0 else ""
+                basis_chg_str = f'{b_sign}{basis_spread_change:.0f}¢'
+                basis_chg_color = COLOR_POSITIVE if basis_spread_change > 0 else COLOR_NEGATIVE
+                basis_chg_cell = f'<span style="color:{basis_chg_color};font-size:11px;">{basis_chg_str}</span>'
+            elif basis_spread_change is not None:
+                basis_chg_cell = '<span style="color:#9ca3af;font-size:11px;">unch</span>'
+            else:
+                basis_chg_cell = '<span style="color:#9ca3af;font-size:11px;">—</span>'
+
+            rows_html += f"""
+          <tr>
+            <td style="{_td_style(alt)};font-size:12px;">{s.get('commodity','')}</td>
+            <td style="{_td_style(alt)};font-size:12px;">{s.get('front_period','')}</td>
+            <td style="{_td_style(alt)};font-size:12px;">{s.get('deferred_period','')}</td>
+            <td style="{_td_style(alt)};font-weight:600;font-size:12px;">{_fmt_spread(cash_spread_today)}</td>
+            <td style="{_td_style(alt)};color:#6b7280;font-size:12px;">{_fmt_spread(cash_spread_prev)}</td>
+            <td style="{_td_style(alt)};font-size:12px;">{chg_cell}</td>
+            <td style="{_td_style(alt)};font-size:11px;">{_fmt_cents_spread(basis_spread_today)}</td>
+            <td style="{_td_style(alt)};font-size:11px;">{basis_chg_cell}</td>
+          </tr>"""
+
+        parts.append(f"""
+    <div style="margin-bottom:20px;">
+      <div style="background:{COLOR_LIGHT_GREEN};padding:8px 12px;border-radius:4px 4px 0 0;
+                  border-left:4px solid {COLOR_PRIMARY};">
+        <strong style="color:{COLOR_PRIMARY};font-size:13px;font-family:Arial,sans-serif;">
+          {elevator_name}
+        </strong>
+      </div>
+      <table style="{_table_style()}margin-bottom:0;">
+        <thead>
+          <tr>
+            <th style="{_th_style()}">Commodity</th>
+            <th style="{_th_style()}">Front Month</th>
+            <th style="{_th_style()}">Deferred</th>
+            <th style="{_th_style()}">Cash Spread Today</th>
+            <th style="{_th_style()}">Prior Day</th>
+            <th style="{_th_style()}">Change</th>
+            <th style="{_th_style()}">Basis Spread</th>
+            <th style="{_th_style()}">Basis Chg</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+    </div>""")
+
+    return "\n".join(parts) if parts else (
+        "<p style='color:#9ca3af;font-size:13px;'>No spread data available.</p>"
+    )
 
 
 def _build_warnings(failed_elevators: list[str]) -> str:

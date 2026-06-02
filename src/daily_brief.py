@@ -14,6 +14,7 @@ Steps:
 
 import asyncio
 import logging
+import os
 import sys
 from datetime import date
 
@@ -35,6 +36,9 @@ logger = logging.getLogger("daily_brief")
 def main() -> None:
     """Main orchestration function."""
     report_date = date.today()
+    dry_run = os.environ.get("DRY_RUN", "false").lower() in ("true", "1", "yes")
+    if dry_run:
+        logger.info("DRY_RUN=true — email will be built but NOT sent")
     logger.info(f"=== Daily Grain Brief starting for {report_date.isoformat()} ===")
 
     # ------------------------------------------------------------------
@@ -121,6 +125,20 @@ def main() -> None:
         logger.warning("Continuing without basis trends")
 
     # ------------------------------------------------------------------
+    # Step 4b: Compute elevator deferred spread changes
+    # ------------------------------------------------------------------
+    logger.info("--- Step 4b: Computing elevator deferred spread changes ---")
+    elevator_spread_data: dict[str, list[dict]] = {}
+    try:
+        from src.basis_tracker import get_elevator_spread_data
+        elevator_spread_data = get_elevator_spread_data(elevator_bids)
+        spread_count = sum(len(v) for v in elevator_spread_data.values())
+        logger.info(f"Computed {spread_count} elevator deferred spread records")
+    except Exception as e:
+        logger.error(f"Elevator spread computation failed: {e}", exc_info=True)
+        logger.warning("Continuing without elevator spread data")
+
+    # ------------------------------------------------------------------
     # Step 5: Build HTML email
     # ------------------------------------------------------------------
     logger.info("--- Step 5: Building HTML email ---")
@@ -131,6 +149,7 @@ def main() -> None:
             futures_data=futures_data,
             elevator_bids=elevator_bids,
             basis_trends=basis_trends,
+            elevator_spread_data=elevator_spread_data,
             report_date=report_date,
         )
         logger.info(f"HTML email built ({len(html_body):,} bytes)")
@@ -144,14 +163,17 @@ def main() -> None:
     # Step 6: Send email
     # ------------------------------------------------------------------
     logger.info("--- Step 6: Sending email via Gmail SMTP ---")
-    try:
-        from src.mailer import send_email
-        send_email(html_body, report_date=report_date)
-        logger.info("Email sent successfully")
-    except Exception as e:
-        logger.error(f"Email send FAILED: {e}", exc_info=True)
-        logger.error("=== Daily Grain Brief FAILED at email send step ===")
-        sys.exit(1)
+    if dry_run:
+        logger.info("DRY_RUN=true — skipping email send. HTML body length: %d bytes", len(html_body))
+    else:
+        try:
+            from src.mailer import send_email
+            send_email(html_body, report_date=report_date)
+            logger.info("Email sent successfully")
+        except Exception as e:
+            logger.error(f"Email send FAILED: {e}", exc_info=True)
+            logger.error("=== Daily Grain Brief FAILED at email send step ===")
+            sys.exit(1)
 
     logger.info("=== Daily Grain Brief completed successfully ===")
 

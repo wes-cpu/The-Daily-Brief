@@ -46,6 +46,7 @@ jobs:
           SCOULAR_PASS: ${{ secrets.SCOULAR_PASS }}
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
 
       - name: Commit and push bid history CSV
         if: always()

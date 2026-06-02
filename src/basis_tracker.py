@@ -7,6 +7,7 @@ trend analysis over 1-week, 2-week, and 1-month windows.
 
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -256,3 +257,211 @@ def get_all_basis_trends(all_bids: dict[str, list[dict]]) -> dict[str, dict]:
                 seen.add(key)
                 trends[key] = get_basis_trend(elevator_name, commodity)
     return trends
+
+
+# ---------------------------------------------------------------------------
+# Delivery period parsing + elevator deferred spread tracking
+# ---------------------------------------------------------------------------
+
+_FUTURES_MONTH_CODE: dict[str, int] = {
+    "F": 1, "G": 2, "H": 3, "K": 5, "M": 6,
+    "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12,
+}
+
+_MONTH_NAMES_TO_NUM: dict[str, int] = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "june": 6, "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
+}
+
+
+def _parse_delivery_period(period: str) -> Optional[tuple[int, int]]:
+    """
+    Parse a delivery period string into a (year, month) tuple for sorting.
+
+    Handles: "JUL25", "Jul 2025", "July 2025", "N25", "ZCN25", "2025-07-15"
+    Returns None if the period cannot be parsed.
+    """
+    if not period:
+        return None
+    p = period.strip()
+
+    # ISO date "2025-07-15" or "2025-07"
+    m = re.match(r"^(\d{4})-(\d{2})", p)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # "JUL25", "Jul 2025", "July 2025", "SEP2025"
+    m = re.match(r"^([A-Za-z]{3,9})\s*(\d{2,4})$", p)
+    if m:
+        mon_str = m.group(1).lower()
+        yr_raw = m.group(2)
+        yr = 2000 + int(yr_raw) if len(yr_raw) == 2 else int(yr_raw)
+        mon = _MONTH_NAMES_TO_NUM.get(mon_str)
+        if mon:
+            return yr, mon
+
+    # Single-letter futures month code "N25"
+    m = re.match(r"^([A-Za-z])(\d{2})$", p)
+    if m:
+        code = m.group(1).upper()
+        yr = 2000 + int(m.group(2))
+        mon = _FUTURES_MONTH_CODE.get(code)
+        if mon:
+            return yr, mon
+
+    # Embedded futures code in ticker like "ZCN25"
+    m = re.search(r"([FGHKMNQUVXZ])(\d{2})\b", p.upper())
+    if m:
+        code = m.group(1)
+        yr = 2000 + int(m.group(2))
+        mon = _FUTURES_MONTH_CODE.get(code)
+        if mon:
+            return yr, mon
+
+    return None
+
+
+def get_elevator_spread_data(
+    today_bids_by_elevator: dict[str, list[dict]],
+) -> dict[str, list[dict]]:
+    """
+    For each elevator/commodity, identify the front-month bid and compute
+    spreads to every deferred delivery period.  Compare today's spreads to
+    the most recent prior-day spreads stored in bids_history.csv.
+
+    Returns dict keyed by elevator name; each value is a list of spread records:
+        {
+            "commodity": str,
+            "front_period": str,
+            "front_cash": float,
+            "front_basis": float | None,
+            "deferred_period": str,
+            "deferred_cash": float,
+            "deferred_basis": float | None,
+            "cash_spread_today": float,        # deferred_cash - front_cash
+            "basis_spread_today": float | None,
+            "cash_spread_prev": float | None,  # same spread from prior day
+            "basis_spread_prev": float | None,
+            "cash_spread_change": float | None,
+            "basis_spread_change": float | None,
+        }
+    """
+    df = _load_history()
+    today_ts = pd.Timestamp(date.today())
+    result: dict[str, list[dict]] = {}
+
+    for elevator_name, bids in today_bids_by_elevator.items():
+        if not bids:
+            continue
+
+        # Group today's bids by commodity
+        by_commodity: dict[str, list[dict]] = {}
+        for bid in bids:
+            commodity = bid.get("commodity", "")
+            if commodity:
+                by_commodity.setdefault(commodity, []).append(bid)
+
+        elevator_spreads: list[dict] = []
+
+        for commodity, cbids in by_commodity.items():
+            # Sort by parsed delivery period (front month first)
+            parsed: list[tuple[tuple[int, int], dict]] = []
+            for bid in cbids:
+                period = bid.get("delivery_period", "")
+                key = _parse_delivery_period(period) or (9999, 99)
+                parsed.append((key, bid))
+            parsed.sort(key=lambda x: x[0])
+
+            if len(parsed) < 2:
+                continue
+
+            _, front_bid = parsed[0]
+            front_period = front_bid.get("delivery_period", "")
+            front_cash = front_bid.get("cash_price")
+            front_basis = front_bid.get("basis")
+
+            if front_cash is None:
+                continue
+
+            # Load prior-day bids for spread comparison (up to 5 days back for weekends)
+            hist_sub: Optional[pd.DataFrame] = None
+            if not df.empty:
+                hist_mask = (
+                    (df["elevator"].str.lower() == elevator_name.lower()) &
+                    (df["commodity"].str.lower().str.contains(commodity.lower(), na=False)) &
+                    (df["date"] < today_ts) &
+                    (df["date"] >= today_ts - pd.Timedelta(days=5))
+                )
+                sub = df[hist_mask].copy()
+                if not sub.empty:
+                    last_date = sub["date"].max()
+                    hist_sub = sub[sub["date"] == last_date]
+
+            for deferred_key, deferred_bid in parsed[1:]:
+                deferred_period = deferred_bid.get("delivery_period", "")
+                deferred_cash = deferred_bid.get("cash_price")
+                deferred_basis = deferred_bid.get("basis")
+
+                if deferred_cash is None:
+                    continue
+
+                cash_spread_today = deferred_cash - front_cash
+                basis_spread_today = (
+                    (deferred_basis - front_basis)
+                    if deferred_basis is not None and front_basis is not None
+                    else None
+                )
+
+                cash_spread_prev: Optional[float] = None
+                basis_spread_prev: Optional[float] = None
+                cash_spread_change: Optional[float] = None
+                basis_spread_change: Optional[float] = None
+
+                if hist_sub is not None and not hist_sub.empty:
+                    hist_parsed: list[tuple[tuple[int, int], pd.Series]] = []
+                    for _, row in hist_sub.iterrows():
+                        pkey = _parse_delivery_period(str(row["delivery_period"])) or (9999, 99)
+                        hist_parsed.append((pkey, row))
+                    hist_parsed.sort(key=lambda x: x[0])
+
+                    if len(hist_parsed) >= 2:
+                        _, h_front = hist_parsed[0]
+                        h_front_cash = float(h_front["cash_price"]) if pd.notna(h_front["cash_price"]) else None
+                        h_front_basis = float(h_front["basis"]) if pd.notna(h_front["basis"]) else None
+
+                        for h_def_key, h_def in hist_parsed[1:]:
+                            if h_def_key == deferred_key:
+                                h_def_cash = float(h_def["cash_price"]) if pd.notna(h_def["cash_price"]) else None
+                                h_def_basis = float(h_def["basis"]) if pd.notna(h_def["basis"]) else None
+                                if h_front_cash is not None and h_def_cash is not None:
+                                    cash_spread_prev = h_def_cash - h_front_cash
+                                    cash_spread_change = cash_spread_today - cash_spread_prev
+                                if h_front_basis is not None and h_def_basis is not None:
+                                    basis_spread_prev = h_def_basis - h_front_basis
+                                    if basis_spread_today is not None:
+                                        basis_spread_change = basis_spread_today - basis_spread_prev
+                                break
+
+                elevator_spreads.append({
+                    "commodity": commodity,
+                    "front_period": front_period,
+                    "front_cash": front_cash,
+                    "front_basis": front_basis,
+                    "deferred_period": deferred_period,
+                    "deferred_cash": deferred_cash,
+                    "deferred_basis": deferred_basis,
+                    "cash_spread_today": cash_spread_today,
+                    "basis_spread_today": basis_spread_today,
+                    "cash_spread_prev": cash_spread_prev,
+                    "basis_spread_prev": basis_spread_prev,
+                    "cash_spread_change": cash_spread_change,
+                    "basis_spread_change": basis_spread_change,
+                })
+
+        if elevator_spreads:
+            result[elevator_name] = elevator_spreads
+
+    return result
