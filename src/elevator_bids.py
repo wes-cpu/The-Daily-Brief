@@ -114,12 +114,21 @@ def _fetch_scoular_mfa_code(
 # ---------------------------------------------------------------------------
 
 def _parse_price(raw: str) -> Optional[float]:
-    """Parse a price string like '4.50', '450', '$4.50' into a float."""
+    """Parse a price string including CBOT fraction format ('440-2' = 440.25¢/bu)."""
     if not raw:
         return None
-    cleaned = re.sub(r"[^\d.\-]", "", raw.strip())
+    raw = raw.strip()
+    # CBOT fraction format: whole-eighths, e.g. "440-2" = 440 + 2/8 = 440.25
+    m = re.match(r'^(\d+)-(\d+)$', raw)
+    if m:
+        return float(m.group(1)) + float(m.group(2)) / 8.0
+    cleaned = re.sub(r"[^\d.\-]", "", raw)
     try:
-        return float(cleaned)
+        val = float(cleaned)
+        # Reject values that look like dates (e.g. 6302026 from "06/30/2026")
+        if val > 99_999:
+            return None
+        return val
     except ValueError:
         return None
 
@@ -157,17 +166,12 @@ async def _fetch_barchart_bids(
     captured_bids: list[dict] = []
     api_captured = False
 
-    # Barchart WebSol cash-bid APIs use several URL patterns depending on the
-    # widget version.  Widen the net to catch all of them.
+    # Barchart WebSol cash-bid APIs use several URL patterns.  Cast the net
+    # very wide so that widget version changes don't silently break us.
     BARCHART_PATTERNS = (
-        "getCashBids",
-        "cash_bids",
-        "cashbids",
-        "websol.barchart.com",
-        "ondemand.barchart.com",
-        "www-api.barchart.com",
-        "/v2/cashbids",
-        "/v2/cash-bids",
+        "getCashBids", "cash_bids", "cashbids", "cashbid",
+        "grainbid", "barchart.com", "websol.", "ondemand.",
+        "/v2/", "/v3/", "/bids", "cash-bid",
     )
 
     async def handle_response(response):
@@ -177,9 +181,18 @@ async def _fetch_barchart_bids(
             if not any(pat.lower() in rurl.lower() for pat in BARCHART_PATTERNS):
                 return
             ct = response.headers.get("content-type", "")
-            if "json" not in ct:
+            # Skip plain HTML pages; accept JSON, empty, or other content types
+            if "text/html" in ct:
                 return
-            body = await response.json()
+            try:
+                body = await response.json()
+            except Exception:
+                # Try parsing as text if content-type wasn't set to json
+                try:
+                    import json as _json
+                    body = _json.loads(await response.text())
+                except Exception:
+                    return
             api_captured = True
             # Barchart API structure varies; try common shapes
             bids_data = (
@@ -230,7 +243,7 @@ async def _fetch_barchart_bids(
         except Exception:
             continue
 
-    await asyncio.sleep(4)
+    await asyncio.sleep(8)
 
     if api_captured and captured_bids:
         logger.info(f"{elevator_name}: captured {len(captured_bids)} bids via API intercept")
@@ -277,6 +290,26 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
             headers = [await th.inner_text() for th in ths]
             headers = [h.strip().lower() for h in headers]
 
+        # Build column-index map from header names
+        col = {}
+        for i, h in enumerate(headers):
+            if any(k in h for k in ("commodity", "grain", "crop")):
+                col.setdefault("commodity", i)
+            elif any(k in h for k in ("delivery", "period", "month", "start")):
+                col.setdefault("delivery", i)
+            elif any(k in h for k in ("cash", "bid", "price")) and "futures" not in h:
+                col.setdefault("cash", i)
+            elif "basis" in h:
+                col.setdefault("basis", i)
+            elif any(k in h for k in ("futures", "contract", "symbol")):
+                col.setdefault("futures_ref", i)
+            elif any(k in h for k in ("change", "chg")):
+                col.setdefault("change", i)
+
+        def _get(vals, key, default_idx):
+            idx = col.get(key, default_idx)
+            return vals[idx] if idx < len(vals) else ""
+
         for row in rows[1:]:
             cells = await row.query_selector_all("td")
             if not cells:
@@ -284,19 +317,12 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
             vals = [await c.inner_text() for c in cells]
             vals = [v.strip() for v in vals]
 
-            # Map columns heuristically
-            commodity = vals[0] if len(vals) > 0 else ""
-            delivery = vals[1] if len(vals) > 1 else ""
-            cash_raw = vals[2] if len(vals) > 2 else ""
-            basis_raw = vals[3] if len(vals) > 3 else ""
-            futures_ref = vals[4] if len(vals) > 4 else ""
-            change_raw = vals[5] if len(vals) > 5 else ""
-
-            # If we have header info, use it
-            if headers:
-                col_map = {h: i for i, h in enumerate(headers)}
-                commodity = vals[col_map.get("commodity", col_map.get("grain", 0))] if col_map.get("commodity") is not None or col_map.get("grain") is not None else commodity
-                delivery = vals[col_map.get("delivery", col_map.get("period", col_map.get("month", 1)))] if len(vals) > 1 else delivery
+            commodity = _get(vals, "commodity", 0)
+            delivery  = _get(vals, "delivery",  1)
+            cash_raw  = _get(vals, "cash",      2)
+            basis_raw = _get(vals, "basis",     3)
+            futures_ref = _get(vals, "futures_ref", 4)
+            change_raw  = _get(vals, "change",      5)
 
             cash_price = _parse_price(cash_raw)
             basis = _parse_basis(basis_raw)
@@ -534,10 +560,14 @@ async def scrape_adm_gradable(
             nonlocal api_hit
             try:
                 rurl = response.url
-                if any(kw in rurl for kw in ["bids", "cash", "market", "prices", "gradable"]):
+                if any(kw in rurl for kw in ["bids", "cash", "market", "prices", "gradable", "/api/", "commodity"]):
                     ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        body = await response.json()
+                    if "text/html" not in ct:
+                        try:
+                            body = await response.json()
+                        except Exception:
+                            import json as _json
+                            body = _json.loads(await response.text())
                         api_hit = True
                         # Extract from various possible response shapes
                         items = []
@@ -1011,11 +1041,32 @@ async def fetch_all_elevator_bids() -> tuple[dict[str, list[dict]], list[dict]]:
                                 empty list if Scoular was skipped or failed
     """
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = await browser.new_context(
             user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1920, "height": 1080},
             locale="en-US",
+            timezone_id="America/Chicago",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            },
+        )
+        # Hide webdriver flag from bot-detection scripts
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        # Block images and fonts to speed up page loads
+        await context.route(
+            "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot}",
+            lambda route: route.abort(),
         )
 
         # Scoular is run separately (returns a tuple); all others return list[dict]
