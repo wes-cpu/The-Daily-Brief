@@ -57,7 +57,7 @@ jobs:
             echo "No changes to CSV data — nothing to commit"
           else
             git commit -m "chore: update bid history CSV [$(date -u '+%Y-%m-%d')]"
-            git push
+            git push https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git HEAD:${GITHUB_REF_NAME}
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}

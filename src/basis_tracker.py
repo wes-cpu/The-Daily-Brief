@@ -165,6 +165,9 @@ def get_basis_trend(elevator: str, commodity: str) -> dict:
             return result
 
         sub = sub.dropna(subset=["basis"])
+        if sub.empty:
+            logger.debug(f"No non-null basis data for elevator='{elevator}' commodity='{commodity}'")
+            return result
         sub = sub.sort_values("date")
 
         # Get the most common / earliest delivery period (front month proxy)
