@@ -7,6 +7,7 @@ trend analysis over 1-week, 2-week, and 1-month windows.
 
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -259,3 +260,197 @@ def get_all_basis_trends(all_bids: dict[str, list[dict]]) -> dict[str, dict]:
                 seen.add(key)
                 trends[key] = get_basis_trend(elevator_name, commodity)
     return trends
+
+
+# ---------------------------------------------------------------------------
+# Elevator deferred spread tracking
+# ---------------------------------------------------------------------------
+
+_MONTH_ABBR_MAP = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+
+def _parse_delivery_sort_key(period: str) -> tuple[int, int]:
+    """Parse a delivery period string to (year, month) for chronological sorting."""
+    s = str(period).strip()
+    if not s:
+        return (9999, 99)
+
+    # ISO format: "2025-07-01" or "2025-07-01T00:00:00Z"
+    m = re.match(r'^(\d{4})-(\d{1,2})', s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+
+    # MM/DD/YYYY or MM/YYYY
+    m = re.match(r'^(\d{1,2})/(?:\d{1,2}/)?(\d{4})', s)
+    if m:
+        return (int(m.group(2)), int(m.group(1)))
+
+    # "Jul 2025", "July 2025", "Sep/Oct 2025" (use first month found)
+    s_lower = s.lower()
+    ym = re.search(r'\b(20\d{2})\b', s)
+    year = int(ym.group(1)) if ym else 9999
+    for abbr, mnum in _MONTH_ABBR_MAP.items():
+        if abbr in s_lower:
+            return (year, mnum)
+
+    return (9999, 99)
+
+
+def _sort_delivery_periods(periods: list[str]) -> list[str]:
+    """Sort delivery period strings chronologically (earliest first)."""
+    return sorted(periods, key=_parse_delivery_sort_key)
+
+
+def _compute_elevator_spread_on_date(
+    df: pd.DataFrame,
+    elevator: str,
+    commodity: str,
+    deferred_period: str,
+    target_date: date,
+) -> Optional[float]:
+    """
+    Look up the spread (deferred_basis − front_basis) for a specific
+    elevator+commodity and deferred_period on or near target_date.
+    Returns None if insufficient data exists.
+    """
+    if df.empty:
+        return None
+
+    mask = (
+        (df["elevator"].str.lower() == elevator.lower()) &
+        (df["commodity"].str.lower().str.contains(commodity.lower(), na=False))
+    )
+    sub = df[mask].dropna(subset=["basis"]).copy()
+    if sub.empty:
+        return None
+
+    target_ts = pd.Timestamp(target_date)
+    window = sub[
+        (sub["date"] >= target_ts - timedelta(days=3)) &
+        (sub["date"] <= target_ts + timedelta(days=3))
+    ].copy()
+    if window.empty:
+        return None
+
+    window["_dd"] = (window["date"] - target_ts).abs()
+    closest_dt = window["_dd"].min()
+    on_date = window[window["_dd"] == closest_dt]
+
+    sorted_periods = _sort_delivery_periods(
+        on_date["delivery_period"].dropna().unique().tolist()
+    )
+    if not sorted_periods:
+        return None
+
+    front_hist = sorted_periods[0]
+    front_row = on_date[on_date["delivery_period"] == front_hist]
+    if front_row.empty:
+        return None
+    front_basis = float(front_row["basis"].iloc[0])
+
+    deferred_row = on_date[on_date["delivery_period"] == deferred_period]
+    if deferred_row.empty:
+        return None
+    deferred_basis = float(deferred_row["basis"].iloc[0])
+
+    return deferred_basis - front_basis
+
+
+def _spread_direction(current: float, past: Optional[float]) -> str:
+    """Return 'widening'/'narrowing'/'unchanged'/'N/A' for a spread change."""
+    if past is None:
+        return "N/A"
+    diff = current - past
+    if abs(diff) < 0.5:
+        return "unchanged"
+    return "widening" if diff > 0 else "narrowing"
+
+
+def get_elevator_deferred_spread_trends(
+    all_bids: dict[str, list[dict]],
+) -> dict[str, dict]:
+    """
+    For each elevator+commodity with ≥2 delivery periods in today's bids,
+    compute the basis spread (deferred basis − front month basis) for every
+    deferred period and compare to 1-week, 2-week, and 1-month historical data.
+
+    Returns:
+        {
+          "ElevatorName|Commodity": {
+            "front_period": "Jul 2025",
+            "spreads": [
+              {
+                "deferred_period": "Sep 2025",
+                "current_spread": +10.0,    # ¢/bu, positive = inverse
+                "spread_1week_ago": +8.0,
+                "spread_2week_ago": None,
+                "spread_1month_ago": None,
+                "trend_1week": "widening",
+                "trend_2week": "N/A",
+                "trend_1month": "N/A",
+              }, ...
+            ]
+          }, ...
+        }
+    """
+    result: dict[str, dict] = {}
+    today = date.today()
+    date_1week = today - timedelta(days=7)
+    date_2week = today - timedelta(days=14)
+    date_1month = today - timedelta(days=30)
+
+    try:
+        df = _load_history()
+    except Exception as exc:
+        logger.error(f"get_elevator_deferred_spread_trends: load error: {exc}")
+        df = pd.DataFrame(columns=CSV_COLUMNS)
+
+    for elevator_name, bids in all_bids.items():
+        if not bids:
+            continue
+
+        # Collect {commodity: {delivery_period: basis}} from today's bids
+        by_commodity: dict[str, dict[str, float]] = {}
+        for bid in bids:
+            commodity = bid.get("commodity", "")
+            dp = bid.get("delivery_period", "")
+            basis = bid.get("basis")
+            if commodity and dp and basis is not None:
+                by_commodity.setdefault(commodity, {})[dp] = float(basis)
+
+        for commodity, period_basis in by_commodity.items():
+            if len(period_basis) < 2:
+                continue  # Need at least front + one deferred
+
+            sorted_periods = _sort_delivery_periods(list(period_basis.keys()))
+            front_period = sorted_periods[0]
+            front_basis_today = period_basis[front_period]
+
+            spreads = []
+            for dp in sorted_periods[1:]:
+                spread_today = period_basis[dp] - front_basis_today
+                s1w = _compute_elevator_spread_on_date(df, elevator_name, commodity, dp, date_1week)
+                s2w = _compute_elevator_spread_on_date(df, elevator_name, commodity, dp, date_2week)
+                s1m = _compute_elevator_spread_on_date(df, elevator_name, commodity, dp, date_1month)
+
+                spreads.append({
+                    "deferred_period": dp,
+                    "current_spread": spread_today,
+                    "spread_1week_ago": s1w,
+                    "spread_2week_ago": s2w,
+                    "spread_1month_ago": s1m,
+                    "trend_1week": _spread_direction(spread_today, s1w),
+                    "trend_2week": _spread_direction(spread_today, s2w),
+                    "trend_1month": _spread_direction(spread_today, s1m),
+                })
+
+            if spreads:
+                result[f"{elevator_name}|{commodity}"] = {
+                    "front_period": front_period,
+                    "spreads": spreads,
+                }
+
+    return result

@@ -121,6 +121,19 @@ def main() -> None:
         logger.warning("Continuing without basis trends")
 
     # ------------------------------------------------------------------
+    # Step 4b: Compute elevator deferred spread trends
+    # ------------------------------------------------------------------
+    logger.info("--- Step 4b: Computing elevator deferred spread trends ---")
+    spread_trends: dict[str, dict] = {}
+    try:
+        from src.basis_tracker import get_elevator_deferred_spread_trends
+        spread_trends = get_elevator_deferred_spread_trends(elevator_bids)
+        logger.info(f"Computed deferred spread trends for {len(spread_trends)} elevator/commodity combos")
+    except Exception as e:
+        logger.error(f"Deferred spread trend computation failed: {e}", exc_info=True)
+        logger.warning("Continuing without deferred spread trends")
+
+    # ------------------------------------------------------------------
     # Step 5: Build HTML email
     # ------------------------------------------------------------------
     logger.info("--- Step 5: Building HTML email ---")
@@ -131,6 +144,7 @@ def main() -> None:
             futures_data=futures_data,
             elevator_bids=elevator_bids,
             basis_trends=basis_trends,
+            spread_trends=spread_trends,
             report_date=report_date,
         )
         logger.info(f"HTML email built ({len(html_body):,} bytes)")

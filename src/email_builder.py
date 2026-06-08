@@ -94,6 +94,37 @@ def _trend_badge(trend: str) -> str:
     return f'<span style="{style}">{label}</span>'
 
 
+def _fmt_spread(spread: Optional[float]) -> str:
+    """Format an elevator basis spread in ¢/bu with sign."""
+    if spread is None:
+        return "N/A"
+    sign = "+" if spread >= 0 else ""
+    # Mirror the dollar/cent heuristic used in _fmt_basis
+    if abs(spread) < 2.0 and spread != 0:
+        cents = spread * 100
+        return f"{sign}{cents:.0f}¢"
+    return f"{sign}{spread:.0f}¢"
+
+
+def _spread_trend_badge(trend: str) -> str:
+    """Return HTML badge for a deferred-spread trend direction."""
+    styles = {
+        "widening":  "background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;",
+        "narrowing": "background:#fee2e2;color:#b91c1c;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;",
+        "unchanged": "background:#f3f4f6;color:#6b7280;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600;",
+        "N/A":       "background:#f3f4f6;color:#9ca3af;padding:2px 6px;border-radius:4px;font-size:11px;",
+    }
+    labels = {
+        "widening":  "▲ Widening",
+        "narrowing": "▼ Narrowing",
+        "unchanged": "→ Unchanged",
+        "N/A":       "N/A",
+    }
+    style = styles.get(trend, styles["N/A"])
+    label = labels.get(trend, trend)
+    return f'<span style="{style}">{label}</span>'
+
+
 def _section_header(title: str) -> str:
     return f"""
     <tr>
@@ -130,6 +161,7 @@ def build_email(
     futures_data: dict,
     elevator_bids: dict[str, list[dict]],
     basis_trends: dict[str, dict],
+    spread_trends: Optional[dict] = None,
     report_date: Optional[date] = None,
 ) -> str:
     """
@@ -168,6 +200,7 @@ def build_email(
     html_technicals = _build_technicals_table(front_month)
     html_elevator_bids = _build_elevator_bids_section(elevator_bids)
     html_basis_trends = _build_basis_trends_section(basis_trends, elevator_bids)
+    html_elevator_spreads = _build_elevator_spread_section(spread_trends or {})
     html_warnings = _build_warnings(failed_elevators)
 
     # -----------------------------------------------------------------------
@@ -266,9 +299,22 @@ def build_email(
       <h2 style="font-size:15px;font-weight:700;color:{COLOR_PRIMARY};
                  border-bottom:2px solid {COLOR_PRIMARY};padding-bottom:6px;
                  margin:24px 0 12px 0;font-family:Arial,sans-serif;">
-        Basis Trends
+        Basis Trends (Front Month)
       </h2>
       {html_basis_trends}
+
+      <!-- Elevator Deferred Spread Trends -->
+      <h2 style="font-size:15px;font-weight:700;color:{COLOR_PRIMARY};
+                 border-bottom:2px solid {COLOR_PRIMARY};padding-bottom:6px;
+                 margin:24px 0 12px 0;font-family:Arial,sans-serif;">
+        Elevator Deferred Bid Spread Trends
+      </h2>
+      <p style="color:#6b7280;font-size:12px;margin:0 0 10px 0;font-style:italic;">
+        Spread = deferred delivery basis − front month basis. A positive spread means
+        the elevator pays a better basis on deferred deliveries than nearby (inverse
+        carry). Widening = deferred improving vs front month.
+      </p>
+      {html_elevator_spreads}
 
     </td>
   </tr>
@@ -697,6 +743,94 @@ def _build_basis_trends_section(
         {rows_html}
       </tbody>
     </table>"""
+
+
+def _build_elevator_spread_section(spread_trends: dict[str, dict]) -> str:
+    """Build the elevator deferred basis spread trends section."""
+    if not spread_trends:
+        return (
+            "<p style='color:#9ca3af;font-size:13px;'>"
+            "No deferred spread data — elevators may have returned single delivery periods only."
+            "</p>"
+        )
+
+    elevator_order = [
+        "Scoular CBLOC", "Cargill East St. Louis", "Bunge Fairmount City",
+        "Bartlett Jacksonville", "ADM Decatur Soy", "ADM Decatur Corn",
+        "ADM Sauget", "CHS Illinois", "GPRe Madison", "CGB",
+    ]
+
+    def _sort_key(k: str) -> int:
+        elev = k.split("|")[0]
+        try:
+            return elevator_order.index(elev)
+        except ValueError:
+            return len(elevator_order)
+
+    parts = []
+    for key in sorted(spread_trends.keys(), key=_sort_key):
+        key_parts = key.split("|", 1)
+        elevator = key_parts[0]
+        commodity = key_parts[1] if len(key_parts) > 1 else ""
+        data = spread_trends[key]
+        front_period = data.get("front_period", "")
+        spreads = data.get("spreads", [])
+        if not spreads:
+            continue
+
+        rows_html = ""
+        for i, sp in enumerate(spreads):
+            alt = i % 2 == 1
+            dp = sp.get("deferred_period", "")
+            cur  = sp.get("current_spread")
+            s1w  = sp.get("spread_1week_ago")
+            s2w  = sp.get("spread_2week_ago")
+            s1m  = sp.get("spread_1month_ago")
+            rows_html += f"""
+          <tr>
+            <td style="{_td_style(alt)}">{dp}</td>
+            <td style="{_td_style(alt)};font-weight:600;">{_fmt_spread(cur)}</td>
+            <td style="{_td_style(alt)};color:#6b7280;">{_fmt_spread(s1w)}</td>
+            <td style="{_td_style(alt)};color:#6b7280;">{_fmt_spread(s2w)}</td>
+            <td style="{_td_style(alt)};color:#6b7280;">{_fmt_spread(s1m)}</td>
+            <td style="{_td_style(alt)}">{_spread_trend_badge(sp.get("trend_1week","N/A"))}</td>
+            <td style="{_td_style(alt)}">{_spread_trend_badge(sp.get("trend_2week","N/A"))}</td>
+            <td style="{_td_style(alt)}">{_spread_trend_badge(sp.get("trend_1month","N/A"))}</td>
+          </tr>"""
+
+        parts.append(f"""
+    <div style="margin-bottom:20px;">
+      <div style="background:{COLOR_LIGHT_GREEN};padding:8px 12px;border-radius:4px 4px 0 0;
+                  border-left:4px solid {COLOR_PRIMARY};">
+        <strong style="color:{COLOR_PRIMARY};font-size:13px;font-family:Arial,sans-serif;">
+          {elevator} — {commodity}
+        </strong>
+        <span style="color:#6b7280;font-size:11px;margin-left:8px;">
+          Front month: {front_period}
+        </span>
+      </div>
+      <table style="{_table_style()}margin-bottom:0;font-size:12px;">
+        <thead>
+          <tr>
+            <th style="{_th_style()}">Deferred Period</th>
+            <th style="{_th_style()}">Today's Spread</th>
+            <th style="{_th_style()}">1 Wk Ago</th>
+            <th style="{_th_style()}">2 Wk Ago</th>
+            <th style="{_th_style()}">1 Mo Ago</th>
+            <th style="{_th_style()}">1-Wk Trend</th>
+            <th style="{_th_style()}">2-Wk Trend</th>
+            <th style="{_th_style()}">1-Mo Trend</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+    </div>""")
+
+    return "\n".join(parts) if parts else (
+        "<p style='color:#9ca3af;font-size:13px;'>No elevator deferred spread data to display.</p>"
+    )
 
 
 def _build_warnings(failed_elevators: list[str]) -> str:
