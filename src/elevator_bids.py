@@ -154,111 +154,171 @@ async def _new_page(context: BrowserContext, timeout: int = DEFAULT_TIMEOUT) -> 
 # Barchart WebSol helper: network-intercept getCashBids API
 # ---------------------------------------------------------------------------
 
+def _parse_barchart_api_body(body: dict, elevator_name: str) -> list[dict]:
+    """Parse a Barchart WebSol JSON response body into bid dicts."""
+    bids_data = (
+        (body.get("data", {}).get("cashBids", []) if isinstance(body.get("data"), dict) else [])
+        or body.get("cashBids", [])
+        or body.get("results", [])
+        or (body.get("data", []) if isinstance(body.get("data"), list) else [])
+    )
+    bids = []
+    for item in bids_data:
+        if not isinstance(item, dict):
+            continue
+        commodity = item.get("commodity", item.get("name", "")).strip()
+        if not commodity:
+            continue
+        bids.append({
+            "elevator": elevator_name,
+            "commodity": commodity,
+            "delivery_period": item.get("expirationDate", item.get("deliveryPeriod", "")),
+            "cash_price": _parse_price(str(item.get("cashPrice", item.get("price", "")))),
+            "basis": _parse_basis(str(item.get("basis", ""))),
+            "futures_reference": item.get("futuresCode", item.get("contractCode", "")),
+            "change": _parse_price(str(item.get("netChange", item.get("change", "")))),
+        })
+    return bids
+
+
 async def _fetch_barchart_bids(
     page: Page,
     url: str,
     elevator_name: str,
 ) -> list[dict]:
     """
-    For sites powered by Barchart WebSol: intercept the getCashBids API call.
-    Falls back to parsing rendered HTML table on failure.
+    Fetch Barchart WebSol cash bids using page.route() + route.fetch().
+
+    page.route intercepts the request BEFORE the browser JS can consume the
+    response body, which is why the older page.on("response") approach silently
+    failed — by the time our handler ran, the body was already consumed.
     """
     captured_bids: list[dict] = []
     api_captured = False
 
-    # Barchart WebSol cash-bid APIs use several URL patterns.  Cast the net
-    # very wide so that widget version changes don't silently break us.
-    BARCHART_PATTERNS = (
-        "getCashBids", "cash_bids", "cashbids", "cashbid",
-        "grainbid", "barchart.com", "websol.", "ondemand.",
-        "/v2/", "/v3/", "/bids", "cash-bid",
+    # URL substrings that identify Barchart WebSol API calls
+    BARCHART_HINTS = (
+        "getCashBids", "getGrainBids",
+        "websol.barchart.com", "ondemand.websol",
+        "cfwidget.barchart",
     )
 
-    async def handle_response(response):
+    async def intercept_barchart(route):
         nonlocal api_captured
+        req_url = route.request.url
+        if not any(h in req_url for h in BARCHART_HINTS):
+            await route.continue_()
+            return
         try:
-            rurl = response.url
-            if not any(pat.lower() in rurl.lower() for pat in BARCHART_PATTERNS):
-                return
+            response = await route.fetch()
             ct = response.headers.get("content-type", "")
-            # Skip plain HTML pages; accept JSON, empty, or other content types
-            if "text/html" in ct:
-                return
-            try:
-                body = await response.json()
-            except Exception:
-                # Try parsing as text if content-type wasn't set to json
+            if "html" not in ct:
                 try:
-                    import json as _json
-                    body = _json.loads(await response.text())
-                except Exception:
-                    return
-            api_captured = True
-            # Barchart API structure varies; try common shapes
-            bids_data = (
-                body.get("data", {}).get("cashBids", [])
-                or body.get("cashBids", [])
-                or body.get("results", [])
-                or (body.get("data", []) if isinstance(body.get("data"), list) else [])
-            )
-            if isinstance(bids_data, list):
-                for item in bids_data:
-                    commodity = (
-                        item.get("commodity", item.get("name", "Unknown"))
-                        .strip()
-                    )
-                    captured_bids.append({
-                        "elevator": elevator_name,
-                        "commodity": commodity,
-                        "delivery_period": item.get("expirationDate", item.get("deliveryPeriod", "")),
-                        "cash_price": _parse_price(str(item.get("cashPrice", item.get("price", "")))),
-                        "basis": _parse_basis(str(item.get("basis", ""))),
-                        "futures_reference": item.get("futuresCode", item.get("contractCode", "")),
-                        "change": _parse_price(str(item.get("netChange", item.get("change", "")))),
-                    })
-        except Exception:
-            pass
+                    raw = await response.body()
+                    body = json.loads(raw)
+                    new_bids = _parse_barchart_api_body(body, elevator_name)
+                    if new_bids:
+                        captured_bids.extend(new_bids)
+                        api_captured = True
+                        logger.info(
+                            f"{elevator_name}: {len(new_bids)} bids via route intercept "
+                            f"({req_url[:80]})"
+                        )
+                except Exception as e:
+                    logger.debug(f"{elevator_name}: route body parse error for {req_url}: {e}")
+            await route.fulfill(response=response)
+        except Exception as e:
+            logger.debug(f"{elevator_name}: route fetch error: {e}")
+            await route.continue_()
 
-    page.on("response", handle_response)
+    await page.route("**/*", intercept_barchart)
 
     try:
-        await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+        await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
     except Exception as e:
         logger.warning(f"{elevator_name}: navigation error: {e}")
 
-    # Barchart widgets fire their API call after networkidle — give extra time.
-    # Also try waiting for bid-table selectors to confirm the widget has rendered.
-    WIDGET_SELECTORS = [
-        "[class*='cash-bid']",
-        "[class*='cashbid']",
-        "[class*='CashBid']",
-        ".bc-cash-bids",
-        "[data-module='CashBids']",
-        "table tbody tr td",
-    ]
-    for sel in WIDGET_SELECTORS:
-        try:
-            await page.wait_for_selector(sel, timeout=8_000)
-            break
-        except Exception:
-            continue
+    # Scroll to trigger lazy-loaded Barchart widgets (IntersectionObserver)
+    try:
+        await page.evaluate("() => window.scrollTo(0, Math.min(600, document.body.scrollHeight))")
+    except Exception:
+        pass
 
-    await asyncio.sleep(8)
+    # Poll up to 35 s for the widget API call
+    for _ in range(7):
+        if api_captured:
+            break
+        await asyncio.sleep(5)
+
+    await page.unroute("**/*")
 
     if api_captured and captured_bids:
-        logger.info(f"{elevator_name}: captured {len(captured_bids)} bids via API intercept")
         return captured_bids
 
-    # Fallback: parse HTML table
-    logger.info(f"{elevator_name}: API intercept missed; falling back to HTML parse")
+    logger.info(f"{elevator_name}: route intercept missed; trying HTML parse")
     return await _parse_barchart_html(page, elevator_name)
 
 
 async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
-    """Parse rendered Barchart cash-bid table from page HTML."""
+    """
+    Parse rendered Barchart cash-bid data from page HTML.
+
+    Handles both the older table-based layout and the newer div/card layout
+    used by Barchart WebSol v2/v3 widgets.
+    """
     bids = []
     try:
-        # Try multiple possible selectors
+        # ── Approach 1: div/card-based Barchart v2/v3 widget ────────────────
+        # These widgets render rows as divs rather than <tr>/<td>.
+        div_row_selectors = [
+            ".bc-cash-bids tbody tr",
+            "[class*='cashBid'] tr",
+            "[class*='cash-bid'] tr",
+            "[data-module='CashBids'] tr",
+            ".bc-cash-bids [class*='row']",
+            "[class*='CashBids'] [class*='row']",
+            "[class*='cashbid'] [class*='row']",
+        ]
+        rows_found = []
+        for sel in div_row_selectors:
+            try:
+                rows_found = await page.query_selector_all(sel)
+                if rows_found:
+                    logger.debug(f"{elevator_name}: HTML parse using selector '{sel}'")
+                    break
+            except Exception:
+                continue
+
+        if rows_found:
+            for row in rows_found:
+                cells = await row.query_selector_all("td, [class*='cell'], [class*='col']")
+                vals = [await c.inner_text() for c in cells]
+                vals = [v.strip() for v in vals if v.strip()]
+                if len(vals) < 3:
+                    continue
+                commodity = vals[0]
+                delivery  = vals[1] if len(vals) > 1 else ""
+                cash_raw  = vals[2] if len(vals) > 2 else ""
+                basis_raw = vals[3] if len(vals) > 3 else ""
+                futures_ref = vals[4] if len(vals) > 4 else ""
+                change_raw  = vals[5] if len(vals) > 5 else ""
+                if any(h in commodity.lower() for h in ["commodity", "grain", "crop", "description"]):
+                    continue
+                cash_price = _parse_price(cash_raw)
+                if commodity and cash_price is not None:
+                    bids.append({
+                        "elevator": elevator_name,
+                        "commodity": commodity,
+                        "delivery_period": delivery,
+                        "cash_price": cash_price,
+                        "basis": _parse_basis(basis_raw),
+                        "futures_reference": futures_ref,
+                        "change": _parse_price(change_raw),
+                    })
+            if bids:
+                return bids
+
+        # ── Approach 2: classic <table> ─────────────────────────────────────
         selectors = [
             "table.cash-bids",
             "table.bids-table",
@@ -279,7 +339,7 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
                 continue
 
         if not table:
-            logger.warning(f"{elevator_name}: no table found in HTML fallback")
+            logger.warning(f"{elevator_name}: no table or bid widget found in HTML fallback")
             return bids
 
         rows = await table.query_selector_all("tr")
@@ -290,7 +350,6 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
             headers = [await th.inner_text() for th in ths]
             headers = [h.strip().lower() for h in headers]
 
-        # Build column-index map from header names
         col = {}
         for i, h in enumerate(headers):
             if any(k in h for k in ("commodity", "grain", "crop")):
@@ -316,23 +375,20 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
                 continue
             vals = [await c.inner_text() for c in cells]
             vals = [v.strip() for v in vals]
-
             commodity = _get(vals, "commodity", 0)
             delivery  = _get(vals, "delivery",  1)
             cash_raw  = _get(vals, "cash",      2)
             basis_raw = _get(vals, "basis",     3)
             futures_ref = _get(vals, "futures_ref", 4)
             change_raw  = _get(vals, "change",      5)
-
             cash_price = _parse_price(cash_raw)
-            basis = _parse_basis(basis_raw)
             if commodity and cash_price is not None:
                 bids.append({
                     "elevator": elevator_name,
                     "commodity": commodity,
                     "delivery_period": delivery,
                     "cash_price": cash_price,
-                    "basis": basis,
+                    "basis": _parse_basis(basis_raw),
                     "futures_reference": futures_ref,
                     "change": _parse_price(change_raw),
                 })
@@ -545,95 +601,102 @@ async def scrape_adm_gradable(
 ) -> list[dict]:
     """
     ADM Gradable React app scraper (shared logic for Decatur Soy, Decatur Corn, Sauget).
-    Waits for React to render bid cards/table then extracts all bids shown.
+
+    Uses page.route() interception to guarantee response body availability before
+    the React app's fetch() handler consumes it.
     """
     page = await _new_page(context)
-    bids: list[dict] = []
+    api_bids: list[dict] = []
+    api_hit = False
+
+    # URL substrings that suggest the React app's bid-data API calls
+    ADM_HINTS = (
+        "gradable", "/bids", "/bid", "/cash", "/market",
+        "/prices", "/commodity", "/api/", "telus",
+    )
+
+    async def intercept_adm(route):
+        nonlocal api_hit
+        req_url = route.request.url
+        # Only intercept likely data API calls (skip static assets)
+        if any(req_url.endswith(ext) for ext in (".js", ".css", ".woff2", ".woff", ".png", ".jpg", ".ico", ".svg")):
+            await route.continue_()
+            return
+        if not any(h in req_url for h in ADM_HINTS):
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch()
+            ct = response.headers.get("content-type", "")
+            if "json" in ct or "json" in req_url:
+                try:
+                    raw = await response.body()
+                    body = json.loads(raw)
+                    items = []
+                    if isinstance(body, list):
+                        items = body
+                    elif isinstance(body, dict):
+                        for key in ["bids", "data", "results", "cashBids", "items", "listings"]:
+                            if isinstance(body.get(key), list):
+                                items = body[key]
+                                break
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        commodity = item.get("commodity", item.get("commodityName", item.get("name", "")))
+                        if not commodity:
+                            continue
+                        delivery = item.get("deliveryPeriod", item.get("delivery", item.get("period", item.get("contractName", ""))))
+                        cash = item.get("cashPrice", item.get("price", item.get("bidPrice")))
+                        basis = item.get("basis", item.get("basisPrice"))
+                        futures_ref = item.get("futuresCode", item.get("futuresSymbol", item.get("contract", "")))
+                        change = item.get("change", item.get("netChange"))
+                        api_bids.append({
+                            "elevator": elevator_name,
+                            "commodity": str(commodity),
+                            "delivery_period": str(delivery) if delivery else "",
+                            "cash_price": float(cash) if cash is not None else None,
+                            "basis": float(basis) if basis is not None else None,
+                            "futures_reference": str(futures_ref) if futures_ref else "",
+                            "change": float(change) if change is not None else None,
+                        })
+                    if items:
+                        api_hit = True
+                        logger.info(f"{elevator_name}: {len(api_bids)} bids via route intercept ({req_url[:80]})")
+                except Exception as e:
+                    logger.debug(f"{elevator_name}: ADM route parse error for {req_url}: {e}")
+            await route.fulfill(response=response)
+        except Exception as e:
+            logger.debug(f"{elevator_name}: ADM route error: {e}")
+            await route.continue_()
+
     try:
         logger.info(f"{elevator_name}: fetching {url}")
-
-        # Intercept API calls that the React app makes for bid data
-        api_bids: list[dict] = []
-        api_hit = False
-
-        async def handle_response(response):
-            nonlocal api_hit
-            try:
-                rurl = response.url
-                if any(kw in rurl for kw in ["bids", "cash", "market", "prices", "gradable", "/api/", "commodity"]):
-                    ct = response.headers.get("content-type", "")
-                    if "text/html" not in ct:
-                        try:
-                            body = await response.json()
-                        except Exception:
-                            import json as _json
-                            body = _json.loads(await response.text())
-                        api_hit = True
-                        # Extract from various possible response shapes
-                        items = []
-                        if isinstance(body, list):
-                            items = body
-                        elif isinstance(body, dict):
-                            for key in ["bids", "data", "results", "cashBids", "items"]:
-                                if isinstance(body.get(key), list):
-                                    items = body[key]
-                                    break
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            commodity = item.get("commodity", item.get("commodityName", item.get("name", "")))
-                            delivery = item.get("deliveryPeriod", item.get("delivery", item.get("period", item.get("contractName", ""))))
-                            cash = item.get("cashPrice", item.get("price", item.get("bidPrice", None)))
-                            basis = item.get("basis", item.get("basisPrice", None))
-                            futures_ref = item.get("futuresCode", item.get("futuresSymbol", item.get("contract", "")))
-                            change = item.get("change", item.get("netChange", None))
-                            if commodity:
-                                api_bids.append({
-                                    "elevator": elevator_name,
-                                    "commodity": str(commodity),
-                                    "delivery_period": str(delivery) if delivery else "",
-                                    "cash_price": float(cash) if cash is not None else None,
-                                    "basis": float(basis) if basis is not None else None,
-                                    "futures_reference": str(futures_ref) if futures_ref else "",
-                                    "change": float(change) if change is not None else None,
-                                })
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
+        await page.route("**/*", intercept_adm)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
             logger.warning(f"{elevator_name}: navigation warning: {e}")
 
-        # Wait for React to render — try common selectors
-        react_selectors = [
-            ".bid-card",
-            ".bids-table",
-            "table[class*='bid']",
-            "[class*='BidTable']",
-            "[class*='bidRow']",
-            "[class*='bid-row']",
-            "[data-testid*='bid']",
-            "table tbody tr",
-        ]
-        for sel in react_selectors:
-            try:
-                await page.wait_for_selector(sel, timeout=10_000)
-                break
-            except Exception:
-                continue
+        # Scroll to trigger any lazy loading
+        try:
+            await page.evaluate("() => window.scrollTo(0, 400)")
+        except Exception:
+            pass
 
-        # Give extra time for React rendering
-        await asyncio.sleep(3)
+        # Wait up to 25 s for the React app to fetch its data
+        for _ in range(5):
+            if api_hit:
+                break
+            await asyncio.sleep(5)
+
+        await page.unroute("**/*")
 
         if api_hit and api_bids:
-            logger.info(f"{elevator_name}: {len(api_bids)} bids via API intercept")
-            return api_bids
+            return [b for b in api_bids if b.get("cash_price") is not None or b.get("basis") is not None]
 
         # Fallback: scrape rendered HTML
-        # ADM Gradable typically renders a table or card-based layout
         bids = await _parse_adm_gradable_html(page, elevator_name)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
@@ -750,70 +813,102 @@ async def scrape_chs_illinois(context: BrowserContext) -> list[dict]:
     """
     CHS Illinois — public cash bids page.
     Extracts Lowder and Cahokia location bids only.
+    Uses page.route() interception for reliable response body access.
     """
     elevator_name = "CHS Illinois"
     url = "https://www.chs-illinois.com/grain/cash-bids/"
     target_locations = ["lowder", "cahokia"]
     page = await _new_page(context)
-    bids: list[dict] = []
+    api_bids: list[dict] = []
+    api_hit = False
+
+    CHS_HINTS = ("cashbid", "cash_bid", "bids", "market", "grain", "websol", "barchart")
+
+    async def intercept_chs(route):
+        nonlocal api_hit
+        req_url = route.request.url.lower()
+        if any(req_url.endswith(ext) for ext in (".js", ".css", ".woff2", ".woff", ".png", ".jpg", ".ico", ".svg")):
+            await route.continue_()
+            return
+        if not any(h in req_url for h in CHS_HINTS):
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch()
+            ct = response.headers.get("content-type", "")
+            if "json" in ct:
+                raw = await response.body()
+                body = json.loads(raw)
+                items = []
+                if isinstance(body, list):
+                    items = body
+                elif isinstance(body, dict):
+                    for key in ["bids", "data", "results", "cashBids"]:
+                        if isinstance(body.get(key), list):
+                            items = body[key]
+                            break
+                # Try Barchart-style body first (handles getCashBids response shape)
+                bc_bids = _parse_barchart_api_body(body, elevator_name)
+                if bc_bids:
+                    api_bids.extend(bc_bids)
+                    api_hit = True
+                    logger.info(f"{elevator_name}: {len(bc_bids)} bids via Barchart route ({req_url[:60]})")
+                elif items:
+                    # Location-keyed response — collect all, filter to targets later
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        loc = str(item.get("location", item.get("locationName", item.get("elevator", "")))).lower()
+                        commodity = item.get("commodity", item.get("name", ""))
+                        if not commodity:
+                            continue
+                        elev_label = f"CHS {loc.title()}" if loc else elevator_name
+                        api_bids.append({
+                            "elevator": elev_label,
+                            "commodity": str(commodity),
+                            "delivery_period": str(item.get("deliveryPeriod", item.get("period", ""))),
+                            "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
+                            "basis": float(item["basis"]) if item.get("basis") is not None else None,
+                            "futures_reference": str(item.get("futuresCode", "")),
+                            "change": float(item["change"]) if item.get("change") is not None else None,
+                        })
+                    api_hit = True
+                    logger.info(f"{elevator_name}: {len(api_bids)} bids via route ({req_url[:60]})")
+            await route.fulfill(response=response)
+        except Exception as e:
+            logger.debug(f"{elevator_name}: CHS route error: {e}")
+            await route.continue_()
 
     try:
         logger.info(f"{elevator_name}: fetching {url}")
-
-        # Network intercept for API calls
-        api_bids: list[dict] = []
-        api_hit = False
-
-        async def handle_response(response):
-            nonlocal api_hit
-            try:
-                rurl = response.url.lower()
-                if any(kw in rurl for kw in ["cashbid", "cash_bid", "bids", "market"]):
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        body = await response.json()
-                        api_hit = True
-                        items = []
-                        if isinstance(body, list):
-                            items = body
-                        elif isinstance(body, dict):
-                            for key in ["bids", "data", "results", "cashBids"]:
-                                if isinstance(body.get(key), list):
-                                    items = body[key]
-                                    break
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            loc = str(item.get("location", item.get("locationName", item.get("elevator", "")))).lower()
-                            if not any(tl in loc for tl in target_locations):
-                                continue
-                            commodity = item.get("commodity", item.get("name", ""))
-                            api_bids.append({
-                                "elevator": f"CHS {loc.title()}",
-                                "commodity": str(commodity),
-                                "delivery_period": str(item.get("deliveryPeriod", item.get("period", ""))),
-                                "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
-                                "basis": float(item["basis"]) if item.get("basis") is not None else None,
-                                "futures_reference": str(item.get("futuresCode", "")),
-                                "change": float(item["change"]) if item.get("change") is not None else None,
-                            })
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
+        await page.route("**/*", intercept_chs)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(3)
+        try:
+            await page.evaluate("() => window.scrollTo(0, 400)")
+        except Exception:
+            pass
+
+        for _ in range(5):
+            if api_hit:
+                break
+            await asyncio.sleep(5)
+
+        await page.unroute("**/*")
 
         if api_hit and api_bids:
-            logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Lowder+Cahokia)")
+            # Filter to target locations if location data is present
+            filtered = [b for b in api_bids if any(tl in b["elevator"].lower() for tl in target_locations)]
+            if filtered:
+                logger.info(f"{elevator_name}: {len(filtered)} bids (Lowder+Cahokia) via API")
+                return filtered
+            logger.info(f"{elevator_name}: {len(api_bids)} bids via API (all locations)")
             return api_bids
 
-        # HTML fallback: look for location sections
         bids = await _parse_chs_html(page, elevator_name, target_locations)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
@@ -883,69 +978,104 @@ async def _parse_chs_html(page: Page, elevator_name: str, target_locations: list
 async def scrape_gpre_madison(context: BrowserContext) -> list[dict]:
     """
     Green Plains (GPRe) corn bids page — filter for Madison, IL location.
+    Uses page.route() for reliable API interception.
     """
     elevator_name = "GPRe Madison"
     url = "https://gpreinc.com/corn-bids/"
     target_location = "madison"
     page = await _new_page(context)
-    bids: list[dict] = []
+    api_bids: list[dict] = []
+    api_hit = False
+
+    GPRE_HINTS = ("bid", "cash", "corn", "market", "price", "websol", "barchart", "grain")
+
+    async def intercept_gpre(route):
+        nonlocal api_hit
+        req_url = route.request.url.lower()
+        if any(req_url.endswith(ext) for ext in (".js", ".css", ".woff2", ".woff", ".png", ".jpg", ".ico", ".svg")):
+            await route.continue_()
+            return
+        if not any(h in req_url for h in GPRE_HINTS):
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch()
+            ct = response.headers.get("content-type", "")
+            if "json" in ct:
+                raw = await response.body()
+                body = json.loads(raw)
+
+                # Try Barchart-style response first
+                bc_bids = _parse_barchart_api_body(body, elevator_name)
+                if bc_bids:
+                    api_bids.extend(bc_bids)
+                    api_hit = True
+                    logger.info(f"{elevator_name}: {len(bc_bids)} bids via Barchart route ({req_url[:60]})")
+                    await route.fulfill(response=response)
+                    return
+
+                # Try location-based response
+                items = []
+                if isinstance(body, list):
+                    items = body
+                elif isinstance(body, dict):
+                    for key in ["bids", "data", "results", "cashBids", "locations"]:
+                        if isinstance(body.get(key), list):
+                            items = body[key]
+                            break
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    loc = str(item.get("location", item.get("city", item.get("name", "")))).lower()
+                    commodity = item.get("commodity", "Corn")
+                    api_bids.append({
+                        "elevator": elevator_name,
+                        "commodity": str(commodity),
+                        "delivery_period": str(item.get("deliveryPeriod", item.get("period", item.get("month", "")))),
+                        "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
+                        "basis": float(item["basis"]) if item.get("basis") is not None else None,
+                        "futures_reference": str(item.get("futuresCode", "")),
+                        "change": float(item["change"]) if item.get("change") is not None else None,
+                    })
+                if items:
+                    api_hit = True
+                    logger.info(f"{elevator_name}: {len(api_bids)} bids via route ({req_url[:60]})")
+            await route.fulfill(response=response)
+        except Exception as e:
+            logger.debug(f"{elevator_name}: GPRe route error: {e}")
+            await route.continue_()
 
     try:
         logger.info(f"{elevator_name}: fetching {url}")
-
-        api_bids: list[dict] = []
-        api_hit = False
-
-        async def handle_response(response):
-            nonlocal api_hit
-            try:
-                rurl = response.url.lower()
-                if any(kw in rurl for kw in ["bid", "cash", "corn", "market", "price"]):
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        body = await response.json()
-                        api_hit = True
-                        items = []
-                        if isinstance(body, list):
-                            items = body
-                        elif isinstance(body, dict):
-                            for key in ["bids", "data", "results", "cashBids", "locations"]:
-                                if isinstance(body.get(key), list):
-                                    items = body[key]
-                                    break
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            loc = str(item.get("location", item.get("city", item.get("name", "")))).lower()
-                            if target_location not in loc:
-                                continue
-                            commodity = item.get("commodity", "Corn")
-                            api_bids.append({
-                                "elevator": elevator_name,
-                                "commodity": str(commodity),
-                                "delivery_period": str(item.get("deliveryPeriod", item.get("period", item.get("month", "")))),
-                                "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
-                                "basis": float(item["basis"]) if item.get("basis") is not None else None,
-                                "futures_reference": str(item.get("futuresCode", "")),
-                                "change": float(item["change"]) if item.get("change") is not None else None,
-                            })
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
+        await page.route("**/*", intercept_gpre)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(3)
+        try:
+            await page.evaluate("() => window.scrollTo(0, 400)")
+        except Exception:
+            pass
+
+        for _ in range(5):
+            if api_hit:
+                break
+            await asyncio.sleep(5)
+
+        await page.unroute("**/*")
 
         if api_hit and api_bids:
-            logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Madison IL)")
+            # Filter to Madison if location data is present
+            madison_bids = [b for b in api_bids if target_location in b.get("elevator", "").lower()
+                           or target_location in b.get("delivery_period", "").lower()]
+            if madison_bids:
+                logger.info(f"{elevator_name}: {len(madison_bids)} Madison IL bids via API")
+                return madison_bids
+            logger.info(f"{elevator_name}: {len(api_bids)} bids via API (unfiltered)")
             return api_bids
 
-        # HTML fallback
         bids = await _parse_gpre_html(page, elevator_name, target_location)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
