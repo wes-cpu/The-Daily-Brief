@@ -89,6 +89,16 @@ def main() -> None:
             logger.error(f"Cookie rotation failed (non-fatal): {e}", exc_info=True)
 
     # ------------------------------------------------------------------
+    # Step 2c: Save futures data for deferred spread trend tracking
+    # ------------------------------------------------------------------
+    logger.info("--- Step 2c: Saving futures history ---")
+    try:
+        from src.basis_tracker import save_today_futures
+        save_today_futures(futures_data)
+    except Exception as e:
+        logger.error(f"Failed to save futures history: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Step 3: Save today's bids to CSV
     # ------------------------------------------------------------------
     logger.info("--- Step 3: Saving bids to CSV history ---")
@@ -108,17 +118,20 @@ def main() -> None:
         logger.warning("No bids to save to CSV")
 
     # ------------------------------------------------------------------
-    # Step 4: Compute basis trends
+    # Step 4: Compute basis trends + deferred spread trends
     # ------------------------------------------------------------------
-    logger.info("--- Step 4: Computing basis trends ---")
+    logger.info("--- Step 4: Computing basis and spread trends ---")
     basis_trends: dict[str, dict] = {}
+    spread_trends: dict[str, dict] = {}
     try:
-        from src.basis_tracker import get_all_basis_trends
+        from src.basis_tracker import get_all_basis_trends, get_deferred_spread_trends
         basis_trends = get_all_basis_trends(elevator_bids)
         logger.info(f"Computed basis trends for {len(basis_trends)} elevator/commodity combinations")
+        spread_trends = get_deferred_spread_trends(futures_data)
+        logger.info(f"Computed spread trends for {len(spread_trends)} deferred contracts")
     except Exception as e:
-        logger.error(f"Basis trend computation failed: {e}", exc_info=True)
-        logger.warning("Continuing without basis trends")
+        logger.error(f"Trend computation failed: {e}", exc_info=True)
+        logger.warning("Continuing without trend data")
 
     # ------------------------------------------------------------------
     # Step 5: Build HTML email
@@ -131,6 +144,7 @@ def main() -> None:
             futures_data=futures_data,
             elevator_bids=elevator_bids,
             basis_trends=basis_trends,
+            spread_trends=spread_trends,
             report_date=report_date,
         )
         logger.info(f"HTML email built ({len(html_body):,} bytes)")

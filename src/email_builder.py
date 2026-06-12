@@ -130,6 +130,7 @@ def build_email(
     futures_data: dict,
     elevator_bids: dict[str, list[dict]],
     basis_trends: dict[str, dict],
+    spread_trends: Optional[dict] = None,
     report_date: Optional[date] = None,
 ) -> str:
     """
@@ -164,7 +165,7 @@ def build_email(
 
     html_market_overview = _build_market_overview(front_month, date_str, weekday)
     html_futures = _build_futures_table(front_month)
-    html_deferred = _build_deferred_table(deferred)
+    html_deferred = _build_deferred_table(deferred, spread_trends or {})
     html_technicals = _build_technicals_table(front_month)
     html_elevator_bids = _build_elevator_bids_section(elevator_bids)
     html_basis_trends = _build_basis_trends_section(basis_trends, elevator_bids)
@@ -400,8 +401,27 @@ def _build_futures_table(front_month: dict) -> str:
     </table>"""
 
 
-def _build_deferred_table(deferred: dict) -> str:
-    """Build the deferred contracts spread table."""
+def _fmt_spread_chg(val: Optional[float]) -> str:
+    """Format a spread change value; positive = carry widened."""
+    if val is None:
+        return "—"
+    sign = "+" if val >= 0 else ""
+    return f"{sign}{val:.2f}"
+
+
+def _spread_chg_color(val: Optional[float]) -> str:
+    """Wider carry (positive) = amber; narrower (negative) = teal; neutral = gray."""
+    if val is None:
+        return "#9ca3af"
+    if abs(val) < 0.5:
+        return "#9ca3af"
+    # For carry markets: widening spread (more carry) is generally bearish for spot.
+    # Color both directions so the user can see movement at a glance.
+    return "#d97706" if val > 0 else "#0891b2"
+
+
+def _build_deferred_table(deferred: dict, spread_trends: dict) -> str:
+    """Build the deferred contracts spread table, including day/week/month spread changes."""
     rows_html = ""
     row_idx = 0
     commodity_emojis = {"corn": "🌽", "soybeans": "🫘", "wheat": "🌾"}
@@ -413,7 +433,7 @@ def _build_deferred_table(deferred: dict) -> str:
             rows_html += f"""
         <tr>
           <td style="{_td_style(alt)}">{commodity_emojis.get(commodity,'')} {commodity.title()}</td>
-          <td style="{_td_style(alt)}" colspan="4">No deferred data</td>
+          <td style="{_td_style(alt)}" colspan="7">No deferred data</td>
         </tr>"""
             row_idx += 1
             continue
@@ -424,14 +444,24 @@ def _build_deferred_table(deferred: dict) -> str:
             spread_color = _change_color(spread)
             spread_str = _fmt_change(spread) if spread is not None else "N/A"
             price = _fmt_price(contract.get("price"), 4)
+            contract_name = contract.get("contract_name", "")
+
+            trend_key = f"{commodity}|{contract_name}"
+            trend = spread_trends.get(trend_key, {})
+            chg_1d = trend.get("change_1day")
+            chg_1w = trend.get("change_1week")
+            chg_1m = trend.get("change_1month")
 
             rows_html += f"""
         <tr>
           <td style="{_td_style(alt)}">{commodity_emojis.get(commodity,'')} {commodity.title()}</td>
-          <td style="{_td_style(alt)};font-family:monospace;">{contract.get('contract_name','')}</td>
+          <td style="{_td_style(alt)};font-family:monospace;">{contract_name}</td>
           <td style="{_td_style(alt)};">{contract.get('month_name','')}</td>
           <td style="{_td_style(alt)};font-weight:600;">{price}</td>
           <td style="{_td_style(alt)};color:{spread_color};font-weight:600;">{spread_str}</td>
+          <td style="{_td_style(alt)};color:{_spread_chg_color(chg_1d)};font-size:12px;">{_fmt_spread_chg(chg_1d)}</td>
+          <td style="{_td_style(alt)};color:{_spread_chg_color(chg_1w)};font-size:12px;">{_fmt_spread_chg(chg_1w)}</td>
+          <td style="{_td_style(alt)};color:{_spread_chg_color(chg_1m)};font-size:12px;">{_fmt_spread_chg(chg_1m)}</td>
         </tr>"""
             row_idx += 1
 
@@ -447,12 +477,19 @@ def _build_deferred_table(deferred: dict) -> str:
           <th style="{_th_style()}">Month</th>
           <th style="{_th_style()}">Price ($/bu)</th>
           <th style="{_th_style()}">Spread vs Front</th>
+          <th style="{_th_style()}">1-Day Δ</th>
+          <th style="{_th_style()}">1-Wk Δ</th>
+          <th style="{_th_style()}">1-Mo Δ</th>
         </tr>
       </thead>
       <tbody>
         {rows_html}
       </tbody>
-    </table>"""
+    </table>
+    <p style="font-size:11px;color:#9ca3af;margin-top:4px;">
+      Spread Δ columns show how the carry has moved. Positive = spread widened (more carry);
+      negative = spread narrowed. Amber = wider; teal = tighter. — = insufficient history.
+    </p>"""
 
 
 def _build_technicals_table(front_month: dict) -> str:

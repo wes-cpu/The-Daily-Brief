@@ -1,27 +1,26 @@
 """
-basis_tracker.py - CSV storage and basis trend calculation.
+basis_tracker.py - CSV storage and basis / futures-spread trend calculation.
 
-Stores daily elevator bids to data/bids_history.csv and provides
-trend analysis over 1-week, 2-week, and 1-month windows.
+Stores daily elevator bids to data/bids_history.csv and futures prices to
+data/futures_history.csv.  Provides trend analysis over 1-week, 2-week, and
+1-month windows for both basis and deferred futures spreads.
 """
 
 import logging
-import os
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from dotenv import load_dotenv
 
-# Load .env for local runs (GitHub Actions uses secrets instead)
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# CSV path relative to repo root
 _REPO_ROOT = Path(__file__).parent.parent
 CSV_PATH = _REPO_ROOT / "data" / "bids_history.csv"
+FUTURES_CSV_PATH = _REPO_ROOT / "data" / "futures_history.csv"
 
 CSV_COLUMNS = [
     "date",
@@ -33,14 +32,27 @@ CSV_COLUMNS = [
     "futures_symbol",
 ]
 
+FUTURES_CSV_COLUMNS = [
+    "date",
+    "commodity",
+    "contract",      # e.g. "front_month", "ZCU2026", "ZCZ2026"
+    "price",
+    "spread_vs_front",  # None for front_month row
+]
+
 
 def _ensure_csv_exists() -> None:
-    """Create the CSV file with headers if it does not exist."""
     CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CSV_PATH.exists():
-        df = pd.DataFrame(columns=CSV_COLUMNS)
-        df.to_csv(CSV_PATH, index=False)
-        logger.info(f"Created new CSV at {CSV_PATH}")
+        pd.DataFrame(columns=CSV_COLUMNS).to_csv(CSV_PATH, index=False)
+        logger.info(f"Created new bids CSV at {CSV_PATH}")
+
+
+def _ensure_futures_csv_exists() -> None:
+    FUTURES_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not FUTURES_CSV_PATH.exists():
+        pd.DataFrame(columns=FUTURES_CSV_COLUMNS).to_csv(FUTURES_CSV_PATH, index=False)
+        logger.info(f"Created new futures CSV at {FUTURES_CSV_PATH}")
 
 
 def _load_history() -> pd.DataFrame:
@@ -238,6 +250,159 @@ def get_basis_trend(elevator: str, commodity: str) -> dict:
 
     except Exception as e:
         logger.error(f"get_basis_trend error for {elevator}/{commodity}: {e}", exc_info=True)
+
+    return result
+
+
+def save_today_futures(futures_data: dict) -> None:
+    """
+    Append today's futures prices and deferred spreads to futures_history.csv.
+
+    futures_data: return value of fetch_all_futures()
+    """
+    today_str = date.today().isoformat()
+    rows = []
+
+    front_month = futures_data.get("front_month", {})
+    deferred = futures_data.get("deferred", {})
+
+    for commodity in ("corn", "soybeans", "wheat"):
+        fm = front_month.get(commodity)
+        if fm is None:
+            continue
+
+        rows.append({
+            "date": today_str,
+            "commodity": commodity,
+            "contract": "front_month",
+            "price": fm.get("price"),
+            "spread_vs_front": None,
+        })
+
+        for dc in deferred.get(commodity, []):
+            rows.append({
+                "date": today_str,
+                "commodity": commodity,
+                "contract": dc.get("contract_name", ""),
+                "price": dc.get("price"),
+                "spread_vs_front": dc.get("spread"),
+            })
+
+    if not rows:
+        logger.warning("save_today_futures: no futures data to save")
+        return
+
+    new_df = pd.DataFrame(rows, columns=FUTURES_CSV_COLUMNS)
+    _ensure_futures_csv_exists()
+
+    try:
+        existing_df = _load_futures_history()
+        if not existing_df.empty:
+            today_ts = pd.Timestamp(today_str)
+            mask = existing_df["date"].dt.normalize() == today_ts
+            existing_df = existing_df[~mask]
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+        combined.to_csv(FUTURES_CSV_PATH, index=False)
+        logger.info(f"Saved {len(rows)} futures rows for {today_str}")
+    except Exception as e:
+        logger.error(f"Failed to save futures to CSV: {e}", exc_info=True)
+
+
+def _load_futures_history() -> pd.DataFrame:
+    _ensure_futures_csv_exists()
+    try:
+        df = pd.read_csv(FUTURES_CSV_PATH, parse_dates=["date"])
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df["spread_vs_front"] = pd.to_numeric(df["spread_vs_front"], errors="coerce")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to load futures CSV: {e}")
+        return pd.DataFrame(columns=FUTURES_CSV_COLUMNS)
+
+
+def get_deferred_spread_trends(futures_data: dict) -> dict[str, dict]:
+    """
+    For each deferred contract compare today's spread to 1-day, 1-week, and
+    1-month prior, returning a dict keyed by "commodity|contract_name".
+
+    Return shape per key:
+        {
+            "contract_name": str,
+            "month_name": str,
+            "current_spread": float | None,
+            "spread_1day_ago": float | None,
+            "spread_1week_ago": float | None,
+            "spread_1month_ago": float | None,
+            "change_1day": float | None,   # positive = carry widened (contango deepened)
+            "change_1week": float | None,
+            "change_1month": float | None,
+        }
+    """
+    df = _load_futures_history()
+    today = date.today()
+    result: dict[str, dict] = {}
+
+    deferred = futures_data.get("deferred", {})
+
+    for commodity, contracts in deferred.items():
+        for dc in contracts:
+            contract_name = dc.get("contract_name", "")
+            month_name = dc.get("month_name", "")
+            current_spread = dc.get("spread")
+
+            key = f"{commodity}|{contract_name}"
+            entry: dict = {
+                "contract_name": contract_name,
+                "month_name": month_name,
+                "current_spread": current_spread,
+                "spread_1day_ago": None,
+                "spread_1week_ago": None,
+                "spread_1month_ago": None,
+                "change_1day": None,
+                "change_1week": None,
+                "change_1month": None,
+            }
+
+            if df.empty or current_spread is None:
+                result[key] = entry
+                continue
+
+            mask = (
+                (df["commodity"] == commodity)
+                & (df["contract"] == contract_name)
+                & (~df["spread_vs_front"].isna())
+            )
+            sub = df[mask].sort_values("date")
+            if sub.empty:
+                result[key] = entry
+                continue
+
+            def _nearest_spread(target: date) -> Optional[float]:
+                ts = pd.Timestamp(target)
+                window = sub[
+                    (sub["date"] >= ts - timedelta(days=3))
+                    & (sub["date"] <= ts + timedelta(days=3))
+                ].copy()
+                if window.empty:
+                    return None
+                window["diff"] = (window["date"] - ts).abs()
+                row = window.nsmallest(1, "diff")
+                val = row["spread_vs_front"].iloc[0]
+                return float(val) if pd.notna(val) else None
+
+            s1d = _nearest_spread(today - timedelta(days=1))
+            s1w = _nearest_spread(today - timedelta(days=7))
+            s1m = _nearest_spread(today - timedelta(days=30))
+
+            entry.update({
+                "spread_1day_ago": s1d,
+                "spread_1week_ago": s1w,
+                "spread_1month_ago": s1m,
+                "change_1day": round(current_spread - s1d, 4) if s1d is not None else None,
+                "change_1week": round(current_spread - s1w, 4) if s1w is not None else None,
+                "change_1month": round(current_spread - s1m, 4) if s1m is not None else None,
+            })
+            result[key] = entry
 
     return result
 

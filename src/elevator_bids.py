@@ -27,8 +27,79 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 DEFAULT_TIMEOUT = 30_000  # 30 seconds in ms
+
+# Comprehensive stealth script applied to every page.
+# Patches the fingerprinting surfaces that headless-Chrome detection checks.
+_STEALTH_SCRIPT = """
+// Disable webdriver flag
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+// Realistic plugins list
+const _plugins = [
+  {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer', description:'Portable Document Format',length:1},
+  {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:'',length:1},
+  {name:'Native Client', filename:'internal-nacl-plugin', description:'',length:0},
+];
+Object.defineProperty(navigator, 'plugins', {get: () => _plugins});
+Object.defineProperty(navigator, 'mimeTypes', {get: () => []});
+
+// Language / locale
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'language', {get: () => 'en-US'});
+
+// Hardware hints — match a normal desktop
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+
+// Chrome runtime object expected by Barchart widgets
+if (!window.chrome) {
+  window.chrome = {
+    runtime: {},
+    app: {isInstalled: false},
+    loadTimes: function() {
+      return {
+        commitLoadTime: Date.now()/1000 - 0.3,
+        connectionInfo: 'http/1.1',
+        finishDocumentLoadTime: 0, finishLoadTime: 0,
+        firstPaintAfterLoadTime: 0, firstPaintTime: 0,
+        navigationType: 'Other', npnNegotiatedProtocol: 'unknown',
+        requestTime: Date.now()/1000 - 0.8,
+        startLoadTime: Date.now()/1000 - 1.0,
+        wasAlternateProtocolAvailable: false,
+        wasFetchedViaSpdy: false, wasNpnNegotiated: false,
+      };
+    },
+    csi: function() {
+      return {
+        onloadT: Date.now(),
+        pageT: Date.now() - performance.timing.navigationStart,
+        startE: performance.timing.navigationStart, tran: 15,
+      };
+    },
+  };
+}
+
+// Permissions — avoid automated-browser fingerprint
+const _origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (p) =>
+  p.name === 'notifications'
+    ? Promise.resolve({state: Notification.permission})
+    : _origQuery(p);
+
+// Slight canvas noise to break pixel-exact fingerprinting
+const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
+  const d = _origGetImageData.call(this, x, y, w, h);
+  for (let i = 0; i < d.data.length; i += 97) { d.data[i] ^= 1; }
+  return d;
+};
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +114,9 @@ def _fetch_scoular_mfa_code(
     poll_interval: int = 5,
 ) -> Optional[str]:
     """
-    Poll the inbox at imap_user (Google Workspace / Gmail) for a Scoular
-    security-code email, retrying every poll_interval seconds for up to
-    wait_seconds total.  Returns the extracted numeric code, or None on failure.
+    Poll the inbox at imap_user for a Scoular security-code email,
+    retrying every poll_interval seconds for up to wait_seconds total.
+    Returns the extracted 6-digit code, or None on failure.
     """
     deadline = time.monotonic() + wait_seconds
     attempt = 0
@@ -57,23 +128,18 @@ def _fetch_scoular_mfa_code(
                 mail.login(imap_user, imap_pass)
                 mail.select("INBOX")
 
-                # Search for recent Scoular emails (last 10 minutes is plenty)
-                # SINCE is date-only in IMAP; combine with a body/subject search.
                 status, msg_ids = mail.search(
                     None,
                     '(FROM "scoular" SUBJECT "security" UNSEEN)',
                 )
                 if status != "OK" or not msg_ids[0]:
-                    # Broaden: any unseen Scoular email
                     status, msg_ids = mail.search(None, '(FROM "scoular" UNSEEN)')
 
                 if status == "OK" and msg_ids[0]:
                     ids = msg_ids[0].split()
-                    # Check the most recent matching message
                     raw = mail.fetch(ids[-1], "(RFC822)")[1][0][1]
                     msg = email_lib.message_from_bytes(raw)
 
-                    # Walk all parts looking for the code
                     body = ""
                     if msg.is_multipart():
                         for part in msg.walk():
@@ -82,27 +148,25 @@ def _fetch_scoular_mfa_code(
                     else:
                         body = msg.get_payload(decode=True).decode(errors="replace")
 
-                    # Scoular codes are typically 6-digit numbers
                     match = re.search(r"\b(\d{6})\b", body)
                     if match:
                         code = match.group(1)
-                        logger.info(f"Scoular MFA: found code {code} in email (attempt {attempt})")
-                        # Mark the message as seen so we don't re-use it
+                        logger.info(f"Scoular MFA: found code {code} (attempt {attempt})")
                         mail.store(ids[-1], "+FLAGS", "\\Seen")
                         return code
                     else:
-                        logger.debug(f"Scoular MFA: email found but no 6-digit code in body (attempt {attempt})")
+                        logger.debug(f"Scoular MFA: email found but no 6-digit code (attempt {attempt})")
                 else:
                     logger.debug(f"Scoular MFA: no matching email yet (attempt {attempt})")
 
         except imaplib.IMAP4.error as exc:
             logger.error(f"Scoular MFA IMAP error: {exc}")
-            return None  # auth failure — no point retrying
+            return None
 
         remaining = deadline - time.monotonic()
         if remaining > 0:
             sleep_for = min(poll_interval, remaining)
-            logger.info(f"Scoular MFA: waiting {sleep_for:.0f}s for code email… ({remaining:.0f}s remaining)")
+            logger.info(f"Scoular MFA: waiting {sleep_for:.0f}s… ({remaining:.0f}s left)")
             time.sleep(sleep_for)
 
     logger.error(f"Scoular MFA: code not received within {wait_seconds}s")
@@ -118,14 +182,12 @@ def _parse_price(raw: str) -> Optional[float]:
     if not raw:
         return None
     raw = raw.strip()
-    # CBOT fraction format: whole-eighths, e.g. "440-2" = 440 + 2/8 = 440.25
     m = re.match(r'^(\d+)-(\d+)$', raw)
     if m:
         return float(m.group(1)) + float(m.group(2)) / 8.0
     cleaned = re.sub(r"[^\d.\-]", "", raw)
     try:
         val = float(cleaned)
-        # Reject values that look like dates (e.g. 6302026 from "06/30/2026")
         if val > 99_999:
             return None
         return val
@@ -151,7 +213,104 @@ async def _new_page(context: BrowserContext, timeout: int = DEFAULT_TIMEOUT) -> 
 
 
 # ---------------------------------------------------------------------------
-# Barchart WebSol helper: network-intercept getCashBids API
+# Generic JSON bid extractor — handles any API response shape
+# ---------------------------------------------------------------------------
+
+_GRAIN_KEYWORDS = frozenset([
+    "corn", "soybean", "soy", "wheat", "bean", "milo",
+    "sorghum", "oat", "meal", "oil", "ddgs",
+])
+
+
+def _looks_like_grain(text: str) -> bool:
+    return any(kw in text.lower() for kw in _GRAIN_KEYWORDS)
+
+
+def _extract_bids_from_response(body: object, elevator_name: str) -> list[dict]:
+    """
+    Extract bid rows from any JSON response shape.
+    Tries common key names; filters to grain commodities only.
+    """
+    if not body:
+        return []
+
+    # Flatten nested structures to get a list of candidate items
+    items: list = []
+    if isinstance(body, list):
+        items = body
+    elif isinstance(body, dict):
+        for key in ("data", "cashBids", "bids", "results", "items",
+                    "quotes", "markets", "rows", "records"):
+            val = body.get(key)
+            if isinstance(val, list):
+                items = val
+                break
+            if isinstance(val, dict):
+                for sub in ("cashBids", "bids", "data", "results"):
+                    sv = val.get(sub)
+                    if isinstance(sv, list):
+                        items = sv
+                        break
+                if items:
+                    break
+        if not items:
+            # Last resort: search all list-valued keys
+            for val in body.values():
+                if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
+                    items = val
+                    break
+
+    bids = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        commodity = str(
+            item.get("commodity") or item.get("name") or item.get("commodityName")
+            or item.get("description") or item.get("grainType") or ""
+        ).strip()
+
+        if not commodity or not _looks_like_grain(commodity):
+            continue
+
+        delivery = str(
+            item.get("deliveryPeriod") or item.get("delivery") or item.get("period")
+            or item.get("expirationDate") or item.get("contractName")
+            or item.get("month") or item.get("contract") or ""
+        ).strip()
+
+        cash_raw = (
+            item.get("cashPrice") or item.get("price") or item.get("bidPrice")
+            or item.get("bid") or item.get("cash") or None
+        )
+        basis_raw = (
+            item.get("basis") or item.get("basisPrice") or item.get("basisAmount") or None
+        )
+        futures_ref = str(
+            item.get("futuresCode") or item.get("futuresSymbol") or item.get("contract")
+            or item.get("contractCode") or item.get("symbol") or ""
+        ).strip()
+        change_raw = (
+            item.get("netChange") or item.get("change") or item.get("priceChange") or None
+        )
+
+        cash_val = _parse_price(str(cash_raw)) if cash_raw is not None else None
+
+        bids.append({
+            "elevator": elevator_name,
+            "commodity": commodity,
+            "delivery_period": delivery,
+            "cash_price": cash_val,
+            "basis": _parse_basis(str(basis_raw)) if basis_raw is not None else None,
+            "futures_reference": futures_ref,
+            "change": _parse_price(str(change_raw)) if change_raw is not None else None,
+        })
+
+    return bids
+
+
+# ---------------------------------------------------------------------------
+# Barchart WebSol helper: intercept any JSON response containing bid data
 # ---------------------------------------------------------------------------
 
 async def _fetch_barchart_bids(
@@ -160,97 +319,73 @@ async def _fetch_barchart_bids(
     elevator_name: str,
 ) -> list[dict]:
     """
-    For sites powered by Barchart WebSol: intercept the getCashBids API call.
-    Falls back to parsing rendered HTML table on failure.
+    For Barchart-WebSol-powered sites: capture cash-bid data from any JSON
+    response.  Falls back to parsing rendered HTML on failure.
+
+    Key changes vs. prior version:
+    - wait_until="load" (not "networkidle") — prevents 30-s stall on
+      sites that keep polling forever.
+    - Captures ALL non-HTML/non-image JSON responses, not just URL-matched ones.
+    - Reduced selector wait (3 s each, 3 selectors) to cut dead time.
+    - asyncio.sleep shortened to 5 s.
     """
     captured_bids: list[dict] = []
     api_captured = False
 
-    # Barchart WebSol cash-bid APIs use several URL patterns.  Cast the net
-    # very wide so that widget version changes don't silently break us.
-    BARCHART_PATTERNS = (
-        "getCashBids", "cash_bids", "cashbids", "cashbid",
-        "grainbid", "barchart.com", "websol.", "ondemand.",
-        "/v2/", "/v3/", "/bids", "cash-bid",
-    )
-
     async def handle_response(response):
         nonlocal api_captured
         try:
-            rurl = response.url
-            if not any(pat.lower() in rurl.lower() for pat in BARCHART_PATTERNS):
+            if response.status >= 400:
                 return
             ct = response.headers.get("content-type", "")
-            # Skip plain HTML pages; accept JSON, empty, or other content types
-            if "text/html" in ct:
+            # Skip obvious non-data types
+            if any(s in ct for s in (
+                "text/html", "image/", "font/", "text/css",
+            )):
                 return
+            # Accept json, empty content-type, and anything not explicitly excluded
             try:
                 body = await response.json()
             except Exception:
-                # Try parsing as text if content-type wasn't set to json
                 try:
-                    import json as _json
-                    body = _json.loads(await response.text())
+                    text = await response.text()
+                    body = json.loads(text)
                 except Exception:
                     return
-            api_captured = True
-            # Barchart API structure varies; try common shapes
-            bids_data = (
-                body.get("data", {}).get("cashBids", [])
-                or body.get("cashBids", [])
-                or body.get("results", [])
-                or (body.get("data", []) if isinstance(body.get("data"), list) else [])
-            )
-            if isinstance(bids_data, list):
-                for item in bids_data:
-                    commodity = (
-                        item.get("commodity", item.get("name", "Unknown"))
-                        .strip()
-                    )
-                    captured_bids.append({
-                        "elevator": elevator_name,
-                        "commodity": commodity,
-                        "delivery_period": item.get("expirationDate", item.get("deliveryPeriod", "")),
-                        "cash_price": _parse_price(str(item.get("cashPrice", item.get("price", "")))),
-                        "basis": _parse_basis(str(item.get("basis", ""))),
-                        "futures_reference": item.get("futuresCode", item.get("contractCode", "")),
-                        "change": _parse_price(str(item.get("netChange", item.get("change", "")))),
-                    })
+
+            bids = _extract_bids_from_response(body, elevator_name)
+            if bids:
+                api_captured = True
+                captured_bids.extend(bids)
+                logger.debug(
+                    f"{elevator_name}: captured {len(bids)} bids from {response.url[:80]}"
+                )
         except Exception:
             pass
 
     page.on("response", handle_response)
 
     try:
-        await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+        await page.goto(url, wait_until="load", timeout=DEFAULT_TIMEOUT)
     except Exception as e:
-        logger.warning(f"{elevator_name}: navigation error: {e}")
+        logger.warning(f"{elevator_name}: navigation: {e}")
 
-    # Barchart widgets fire their API call after networkidle — give extra time.
-    # Also try waiting for bid-table selectors to confirm the widget has rendered.
-    WIDGET_SELECTORS = [
-        "[class*='cash-bid']",
-        "[class*='cashbid']",
-        "[class*='CashBid']",
-        ".bc-cash-bids",
-        "[data-module='CashBids']",
-        "table tbody tr td",
-    ]
-    for sel in WIDGET_SELECTORS:
+    # Wait briefly for widget/content selectors — 3 s each, stop on first hit
+    for sel in ("[class*='bid']", "[class*='cash']", "table tbody tr td"):
         try:
-            await page.wait_for_selector(sel, timeout=8_000)
+            await page.wait_for_selector(sel, timeout=3_000)
             break
         except Exception:
             continue
 
-    await asyncio.sleep(8)
+    await asyncio.sleep(5)
 
     if api_captured and captured_bids:
-        logger.info(f"{elevator_name}: captured {len(captured_bids)} bids via API intercept")
+        logger.info(f"{elevator_name}: {len(captured_bids)} bids via JSON intercept")
         return captured_bids
 
     # Fallback: parse HTML table
-    logger.info(f"{elevator_name}: API intercept missed; falling back to HTML parse")
+    logger.info(f"{elevator_name}: JSON intercept missed; falling back to HTML parse")
     return await _parse_barchart_html(page, elevator_name)
 
 
@@ -258,16 +393,10 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
     """Parse rendered Barchart cash-bid table from page HTML."""
     bids = []
     try:
-        # Try multiple possible selectors
         selectors = [
-            "table.cash-bids",
-            "table.bids-table",
-            ".cashbid-table table",
-            "table[class*='cashbid']",
-            "table[class*='cash-bid']",
-            "table[class*='bids']",
-            "div.cashbid",
-            "table",
+            "table.cash-bids", "table.bids-table", ".cashbid-table table",
+            "table[class*='cashbid']", "table[class*='cash-bid']",
+            "table[class*='bids']", "div.cashbid", "table",
         ]
         table = None
         for sel in selectors:
@@ -290,7 +419,6 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
             headers = [await th.inner_text() for th in ths]
             headers = [h.strip().lower() for h in headers]
 
-        # Build column-index map from header names
         col = {}
         for i, h in enumerate(headers):
             if any(k in h for k in ("commodity", "grain", "crop")):
@@ -352,11 +480,10 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
     Primary method (SCOULAR_COOKIES set):
       Log in manually once using get_scoular_cookies.py, paste the JSON output
       as the SCOULAR_COOKIES GitHub secret.  No MFA required on subsequent runs.
-      Refresh the secret when cookies expire (typically every 30–90 days).
 
     Fallback method (SCOULAR_USER + SCOULAR_PASS set, no cookies):
-      Attempts username/password login.  If Scoular demands an MFA code the
-      run will be skipped with a clear error — refresh SCOULAR_COOKIES instead.
+      Attempts username/password login.  If Scoular demands MFA the run will be
+      skipped — refresh SCOULAR_COOKIES instead.
     """
     elevator_name = "Scoular CBLOC"
     url = "https://scoularview.com/cbloc-1941"
@@ -366,12 +493,11 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
     password = os.environ.get("SCOULAR_PASS", "")
 
     if not cookies_json and not (username and password):
-        logger.warning(f"{elevator_name}: no credentials configured (set SCOULAR_COOKIES); skipping")
+        logger.warning(f"{elevator_name}: no credentials configured; skipping")
         return [], []
 
     page = await _new_page(context, timeout=60_000)
     try:
-        # ── Method 1: inject saved session cookies ───────────────────────────────────────
         if cookies_json:
             try:
                 cookies = json.loads(cookies_json)
@@ -381,11 +507,8 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                 logger.error(f"{elevator_name}: failed to parse SCOULAR_COOKIES — {exc}")
                 return [], []
 
-            await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await page.goto(url, wait_until="load", timeout=60_000)
 
-            # Check whether we landed on the bids page or got bounced to login.
-            # Scoular auth routes through Bushel (app.bushelfarm.com / grain.bushel.ag),
-            # so an expired session redirects to a Bushel domain, not just scoularview.com.
             bounced = any(kw in page.url.lower() for kw in ("login", "signin", "auth", "bushel"))
             if bounced and "scoularview.com" not in page.url.lower():
                 logger.error(
@@ -396,10 +519,9 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
 
             logger.info(f"{elevator_name}: cookie login succeeded; on {page.url}")
 
-        # ── Method 2: username + password (no MFA support) ─────────────────────
         else:
             logger.info(f"{elevator_name}: no cookies; attempting username/password login")
-            await page.goto(url, wait_until="networkidle", timeout=60_000)
+            await page.goto(url, wait_until="load", timeout=60_000)
 
             user_field = await page.query_selector(
                 "input[name='username'], input[name='email'], input[type='email'], "
@@ -422,24 +544,22 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                     await submit.click()
                 else:
                     await pass_field.press("Enter")
-                await page.wait_for_load_state("networkidle", timeout=60_000)
+                await page.wait_for_load_state("load", timeout=60_000)
 
-            # If an MFA field appeared we cannot proceed without the cookie method
             mfa_present = await page.query_selector(
                 "input[name='code'], input[name='otp'], input[name='token'], "
                 "input[maxlength='6'], input[placeholder*='code' i], input[placeholder*='security' i]"
             )
             if mfa_present:
                 logger.error(
-                    f"{elevator_name}: MFA prompt detected — run get_scoular_cookies.py locally, "
-                    "log in with the security code, and store the output as SCOULAR_COOKIES"
+                    f"{elevator_name}: MFA prompt detected — run get_scoular_cookies.py locally "
+                    "and store output as SCOULAR_COOKIES"
                 )
                 return [], []
 
             if url not in page.url:
-                await page.goto(url, wait_until="networkidle", timeout=60_000)
+                await page.goto(url, wait_until="load", timeout=60_000)
 
-        # ── Extract bids ───────────────────────────────────────────────────────────────────────
         bids = await _parse_barchart_html(page, elevator_name)
         if not bids:
             rows = await page.query_selector_all("tr, .bid-row, .market-row")
@@ -462,16 +582,9 @@ async def scrape_scoular_cbloc(context: BrowserContext) -> list[dict]:
                             "change": None,
                         })
 
-        # ── Capture fresh cookies for auto-rotation ─────────────────────────────────
-        # After a successful page visit the server may have issued refreshed
-        # session cookies (sliding expiry).  We capture them so the orchestrator
-        # can write them back to the GitHub secret, keeping the session alive
-        # indefinitely without any manual intervention.
         fresh_cookies: list[dict] = []
         if bids:
             try:
-                # Capture all cookies — Scoular auth runs through Bushel (bushel.ag),
-                # so we need both Bushel and Scoularview cookies for the session to work.
                 fresh_cookies = await context.cookies()
                 logger.info(f"{elevator_name}: captured {len(fresh_cookies)} fresh cookies for rotation")
             except Exception as exc:
@@ -544,96 +657,59 @@ async def scrape_adm_gradable(
     elevator_name: str,
 ) -> list[dict]:
     """
-    ADM Gradable React app scraper (shared logic for Decatur Soy, Decatur Corn, Sauget).
-    Waits for React to render bid cards/table then extracts all bids shown.
+    ADM Gradable React app scraper (shared for Decatur Soy, Decatur Corn, Sauget).
+    Captures any JSON API response, falls back to HTML parse.
     """
     page = await _new_page(context)
-    bids: list[dict] = []
     try:
         logger.info(f"{elevator_name}: fetching {url}")
 
-        # Intercept API calls that the React app makes for bid data
         api_bids: list[dict] = []
         api_hit = False
 
         async def handle_response(response):
             nonlocal api_hit
             try:
-                rurl = response.url
-                if any(kw in rurl for kw in ["bids", "cash", "market", "prices", "gradable", "/api/", "commodity"]):
-                    ct = response.headers.get("content-type", "")
-                    if "text/html" not in ct:
-                        try:
-                            body = await response.json()
-                        except Exception:
-                            import json as _json
-                            body = _json.loads(await response.text())
-                        api_hit = True
-                        # Extract from various possible response shapes
-                        items = []
-                        if isinstance(body, list):
-                            items = body
-                        elif isinstance(body, dict):
-                            for key in ["bids", "data", "results", "cashBids", "items"]:
-                                if isinstance(body.get(key), list):
-                                    items = body[key]
-                                    break
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            commodity = item.get("commodity", item.get("commodityName", item.get("name", "")))
-                            delivery = item.get("deliveryPeriod", item.get("delivery", item.get("period", item.get("contractName", ""))))
-                            cash = item.get("cashPrice", item.get("price", item.get("bidPrice", None)))
-                            basis = item.get("basis", item.get("basisPrice", None))
-                            futures_ref = item.get("futuresCode", item.get("futuresSymbol", item.get("contract", "")))
-                            change = item.get("change", item.get("netChange", None))
-                            if commodity:
-                                api_bids.append({
-                                    "elevator": elevator_name,
-                                    "commodity": str(commodity),
-                                    "delivery_period": str(delivery) if delivery else "",
-                                    "cash_price": float(cash) if cash is not None else None,
-                                    "basis": float(basis) if basis is not None else None,
-                                    "futures_reference": str(futures_ref) if futures_ref else "",
-                                    "change": float(change) if change is not None else None,
-                                })
+                if response.status >= 400:
+                    return
+                ct = response.headers.get("content-type", "")
+                if any(s in ct for s in ("text/html", "image/", "font/", "text/css")):
+                    return
+                try:
+                    body = await response.json()
+                except Exception:
+                    try:
+                        body = json.loads(await response.text())
+                    except Exception:
+                        return
+
+                bids = _extract_bids_from_response(body, elevator_name)
+                if bids:
+                    api_hit = True
+                    api_bids.extend(bids)
             except Exception:
                 pass
 
         page.on("response", handle_response)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            await page.goto(url, wait_until="load", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
-            logger.warning(f"{elevator_name}: navigation warning: {e}")
+            logger.warning(f"{elevator_name}: navigation: {e}")
 
-        # Wait for React to render — try common selectors
-        react_selectors = [
-            ".bid-card",
-            ".bids-table",
-            "table[class*='bid']",
-            "[class*='BidTable']",
-            "[class*='bidRow']",
-            "[class*='bid-row']",
-            "[data-testid*='bid']",
-            "table tbody tr",
-        ]
-        for sel in react_selectors:
+        for sel in ("[class*='bid']", "table tbody tr", "[class*='BidTable']"):
             try:
-                await page.wait_for_selector(sel, timeout=10_000)
+                await page.wait_for_selector(sel, timeout=3_000)
                 break
             except Exception:
                 continue
 
-        # Give extra time for React rendering
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API intercept")
             return api_bids
 
-        # Fallback: scrape rendered HTML
-        # ADM Gradable typically renders a table or card-based layout
         bids = await _parse_adm_gradable_html(page, elevator_name)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
@@ -649,7 +725,6 @@ async def _parse_adm_gradable_html(page: Page, elevator_name: str) -> list[dict]
     """Parse ADM Gradable React-rendered HTML."""
     bids = []
     try:
-        # Try table first
         table = await page.query_selector("table")
         if table:
             rows = await table.query_selector_all("tbody tr, tr")
@@ -659,7 +734,6 @@ async def _parse_adm_gradable_html(page: Page, elevator_name: str) -> list[dict]
                 vals = [v.strip() for v in vals]
                 if len(vals) < 3:
                     continue
-                # Skip header rows
                 if any(h in vals[0].lower() for h in ["commodity", "grain", "bid", "delivery", "period"]):
                     continue
                 commodity = vals[0]
@@ -682,14 +756,12 @@ async def _parse_adm_gradable_html(page: Page, elevator_name: str) -> list[dict]
             if bids:
                 return bids
 
-        # Try card-based layout
         cards = await page.query_selector_all(
             ".bid-card, [class*='bidCard'], [class*='BidCard'], [class*='bid-row'], [class*='BidRow']"
         )
         for card in cards:
             text = await card.inner_text()
             lines = [l.strip() for l in text.split("\n") if l.strip()]
-            # Attempt to extract commodity, delivery, cash, basis from lines
             commodity = ""
             delivery = ""
             cash_price = None
@@ -755,65 +827,94 @@ async def scrape_chs_illinois(context: BrowserContext) -> list[dict]:
     url = "https://www.chs-illinois.com/grain/cash-bids/"
     target_locations = ["lowder", "cahokia"]
     page = await _new_page(context)
-    bids: list[dict] = []
 
     try:
         logger.info(f"{elevator_name}: fetching {url}")
 
-        # Network intercept for API calls
         api_bids: list[dict] = []
         api_hit = False
 
         async def handle_response(response):
             nonlocal api_hit
             try:
-                rurl = response.url.lower()
-                if any(kw in rurl for kw in ["cashbid", "cash_bid", "bids", "market"]):
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        body = await response.json()
+                if response.status >= 400:
+                    return
+                ct = response.headers.get("content-type", "")
+                if any(s in ct for s in ("text/html", "image/", "font/", "text/css")):
+                    return
+                try:
+                    body = await response.json()
+                except Exception:
+                    try:
+                        body = json.loads(await response.text())
+                    except Exception:
+                        return
+
+                # Try generic extraction first, then filter by location
+                items: list = []
+                if isinstance(body, list):
+                    items = body
+                elif isinstance(body, dict):
+                    for key in ("data", "cashBids", "bids", "results", "items"):
+                        if isinstance(body.get(key), list):
+                            items = body[key]
+                            break
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    loc = str(
+                        item.get("location") or item.get("locationName")
+                        or item.get("elevator") or item.get("city") or ""
+                    ).lower()
+                    commodity = str(
+                        item.get("commodity") or item.get("name") or ""
+                    ).strip()
+
+                    if not commodity or not _looks_like_grain(commodity):
+                        continue
+
+                    # Include if location matches or if no location field (let user filter visually)
+                    if loc and not any(tl in loc for tl in target_locations):
+                        continue
+
+                    display_name = f"CHS {loc.title()}" if loc else elevator_name
+                    api_hit = True
+                    api_bids.append({
+                        "elevator": display_name,
+                        "commodity": commodity,
+                        "delivery_period": str(
+                            item.get("deliveryPeriod") or item.get("period") or ""
+                        ),
+                        "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
+                        "basis": float(item["basis"]) if item.get("basis") is not None else None,
+                        "futures_reference": str(item.get("futuresCode") or ""),
+                        "change": float(item["change"]) if item.get("change") is not None else None,
+                    })
+
+                # Also try generic extraction for any remaining data
+                if not api_hit:
+                    bids = _extract_bids_from_response(body, elevator_name)
+                    if bids:
                         api_hit = True
-                        items = []
-                        if isinstance(body, list):
-                            items = body
-                        elif isinstance(body, dict):
-                            for key in ["bids", "data", "results", "cashBids"]:
-                                if isinstance(body.get(key), list):
-                                    items = body[key]
-                                    break
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            loc = str(item.get("location", item.get("locationName", item.get("elevator", "")))).lower()
-                            if not any(tl in loc for tl in target_locations):
-                                continue
-                            commodity = item.get("commodity", item.get("name", ""))
-                            api_bids.append({
-                                "elevator": f"CHS {loc.title()}",
-                                "commodity": str(commodity),
-                                "delivery_period": str(item.get("deliveryPeriod", item.get("period", ""))),
-                                "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
-                                "basis": float(item["basis"]) if item.get("basis") is not None else None,
-                                "futures_reference": str(item.get("futuresCode", "")),
-                                "change": float(item["change"]) if item.get("change") is not None else None,
-                            })
+                        api_bids.extend(bids)
+
             except Exception:
                 pass
 
         page.on("response", handle_response)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            await page.goto(url, wait_until="load", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Lowder+Cahokia)")
             return api_bids
 
-        # HTML fallback: look for location sections
         bids = await _parse_chs_html(page, elevator_name, target_locations)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
@@ -829,9 +930,6 @@ async def _parse_chs_html(page: Page, elevator_name: str, target_locations: list
     """Parse CHS Illinois HTML, filtering for target locations."""
     bids = []
     try:
-        # Try to find location sections/headers
-        content = await page.content()
-        # Look for section headers containing location names
         sections = await page.query_selector_all(
             "section, .location-section, [class*='location'], [class*='elevator'], h2, h3, h4"
         )
@@ -842,10 +940,7 @@ async def _parse_chs_html(page: Page, elevator_name: str, target_locations: list
             text_lower = text.lower().strip()
             if any(tl in text_lower for tl in target_locations):
                 current_location = text.strip()
-                # Get the table after this header
-                table = await elem.evaluate_handle(
-                    "(el) => el.nextElementSibling"
-                )
+                table = await elem.evaluate_handle("(el) => el.nextElementSibling")
                 if table:
                     table_rows = await table.query_selector_all("tr")
                     for row in table_rows:
@@ -872,9 +967,7 @@ async def _parse_chs_html(page: Page, elevator_name: str, target_locations: list
                             })
 
         if not bids:
-            # Try Barchart-style parsing as fallback
             bids = await _parse_barchart_html(page, elevator_name)
-            # Filter by location in bid text if possible
     except Exception as e:
         logger.error(f"{elevator_name}: HTML parse error: {e}")
     return bids
@@ -888,7 +981,6 @@ async def scrape_gpre_madison(context: BrowserContext) -> list[dict]:
     url = "https://gpreinc.com/corn-bids/"
     target_location = "madison"
     page = await _new_page(context)
-    bids: list[dict] = []
 
     try:
         logger.info(f"{elevator_name}: fetching {url}")
@@ -899,53 +991,79 @@ async def scrape_gpre_madison(context: BrowserContext) -> list[dict]:
         async def handle_response(response):
             nonlocal api_hit
             try:
-                rurl = response.url.lower()
-                if any(kw in rurl for kw in ["bid", "cash", "corn", "market", "price"]):
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct:
-                        body = await response.json()
+                if response.status >= 400:
+                    return
+                ct = response.headers.get("content-type", "")
+                if any(s in ct for s in ("text/html", "image/", "font/", "text/css")):
+                    return
+                try:
+                    body = await response.json()
+                except Exception:
+                    try:
+                        body = json.loads(await response.text())
+                    except Exception:
+                        return
+
+                items: list = []
+                if isinstance(body, list):
+                    items = body
+                elif isinstance(body, dict):
+                    for key in ("data", "bids", "results", "cashBids", "locations", "items"):
+                        if isinstance(body.get(key), list):
+                            items = body[key]
+                            break
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    loc = str(
+                        item.get("location") or item.get("city")
+                        or item.get("name") or item.get("locationName") or ""
+                    ).lower()
+                    commodity = str(item.get("commodity") or "Corn").strip()
+
+                    if loc and target_location not in loc:
+                        continue
+
+                    if not _looks_like_grain(commodity):
+                        continue
+
+                    api_hit = True
+                    api_bids.append({
+                        "elevator": elevator_name,
+                        "commodity": commodity,
+                        "delivery_period": str(
+                            item.get("deliveryPeriod") or item.get("period")
+                            or item.get("month") or ""
+                        ),
+                        "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
+                        "basis": float(item["basis"]) if item.get("basis") is not None else None,
+                        "futures_reference": str(item.get("futuresCode") or ""),
+                        "change": float(item["change"]) if item.get("change") is not None else None,
+                    })
+
+                if not api_hit:
+                    bids = _extract_bids_from_response(body, elevator_name)
+                    if bids:
                         api_hit = True
-                        items = []
-                        if isinstance(body, list):
-                            items = body
-                        elif isinstance(body, dict):
-                            for key in ["bids", "data", "results", "cashBids", "locations"]:
-                                if isinstance(body.get(key), list):
-                                    items = body[key]
-                                    break
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            loc = str(item.get("location", item.get("city", item.get("name", "")))).lower()
-                            if target_location not in loc:
-                                continue
-                            commodity = item.get("commodity", "Corn")
-                            api_bids.append({
-                                "elevator": elevator_name,
-                                "commodity": str(commodity),
-                                "delivery_period": str(item.get("deliveryPeriod", item.get("period", item.get("month", "")))),
-                                "cash_price": float(item["cashPrice"]) if item.get("cashPrice") is not None else None,
-                                "basis": float(item["basis"]) if item.get("basis") is not None else None,
-                                "futures_reference": str(item.get("futuresCode", "")),
-                                "change": float(item["change"]) if item.get("change") is not None else None,
-                            })
+                        api_bids.extend(bids)
+
             except Exception:
                 pass
 
         page.on("response", handle_response)
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=DEFAULT_TIMEOUT)
+            await page.goto(url, wait_until="load", timeout=DEFAULT_TIMEOUT)
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Madison IL)")
             return api_bids
 
-        # HTML fallback
         bids = await _parse_gpre_html(page, elevator_name, target_location)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
@@ -961,18 +1079,16 @@ async def _parse_gpre_html(page: Page, elevator_name: str, target_location: str)
     """Parse GPRe HTML for Madison IL bids."""
     bids = []
     try:
-        # Find the Madison section
         all_text = await page.evaluate("document.body.innerText")
-        # Check if Madison is even mentioned
         if target_location.lower() not in all_text.lower():
             logger.warning(f"{elevator_name}: '{target_location}' not found on page")
             return bids
 
-        # Try to find Madison-specific table
         tables = await page.query_selector_all("table")
         for table in tables:
-            # Check parent/surrounding context for Madison label
-            parent_text = await table.evaluate("(el) => { let p = el.parentElement; return p ? p.innerText : ''; }")
+            parent_text = await table.evaluate(
+                "(el) => { let p = el.parentElement; return p ? p.innerText : ''; }"
+            )
             if target_location.lower() in parent_text.lower():
                 rows = await table.query_selector_all("tr")
                 for row in rows:
@@ -999,9 +1115,7 @@ async def _parse_gpre_html(page: Page, elevator_name: str, target_location: str)
                 break
 
         if not bids:
-            # Fallback: parse all bids and note they're from GPRe
             bids = await _parse_barchart_html(page, elevator_name)
-            # Label with Madison if we couldn't filter
     except Exception as e:
         logger.error(f"{elevator_name}: HTML parse error: {e}")
     return bids
@@ -1034,11 +1148,6 @@ async def fetch_all_elevator_bids() -> tuple[dict[str, list[dict]], list[dict]]:
 
     Returns:
         (bids_by_elevator, scoular_fresh_cookies)
-
-        bids_by_elevator  — dict keyed by elevator name, value is list of bid dicts
-        scoular_fresh_cookies — cookies captured after a successful Scoular login,
-                                ready to be written back to SCOULAR_COOKIES secret;
-                                empty list if Scoular was skipped or failed
     """
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -1047,29 +1156,52 @@ async def fetch_all_elevator_bids() -> tuple[dict[str, list[dict]], list[dict]]:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-infobars",
+                "--disable-notifications",
+                "--disable-popup-blocking",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--ignore-certificate-errors",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--window-size=1920,1080",
             ],
         )
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1920, "height": 1080},
+            screen={"width": 1920, "height": 1080},
             locale="en-US",
             timezone_id="America/Chicago",
+            java_script_enabled=True,
+            has_touch=False,
+            is_mobile=False,
+            color_scheme="light",
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+                ),
+                "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "none",
+                "sec-fetch-user": "?1",
+                "upgrade-insecure-requests": "1",
             },
         )
-        # Hide webdriver flag from bot-detection scripts
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        # Apply stealth — must be set on context before pages are created
+        await context.add_init_script(_STEALTH_SCRIPT)
+
         # Block images and fonts to speed up page loads
         await context.route(
             "**/*.{png,jpg,jpeg,gif,svg,ico,webp,woff,woff2,ttf,eot}",
             lambda route: route.abort(),
         )
 
-        # Scoular is run separately (returns a tuple); all others return list[dict]
         non_scoular_tasks = {
             "Cargill East St. Louis": scrape_cargill_east_st_louis(context),
             "Bunge Fairmount City": scrape_bunge_fairmount_city(context),
@@ -1093,7 +1225,6 @@ async def fetch_all_elevator_bids() -> tuple[dict[str, list[dict]], list[dict]]:
         await context.close()
         await browser.close()
 
-    # Unpack Scoular (bids, fresh_cookies)
     output: dict[str, list[dict]] = {}
     scoular_fresh_cookies: list[dict] = []
     if isinstance(scoular_result, Exception):
@@ -1103,7 +1234,6 @@ async def fetch_all_elevator_bids() -> tuple[dict[str, list[dict]], list[dict]]:
         scoular_bids, scoular_fresh_cookies = scoular_result
         output["Scoular CBLOC"] = scoular_bids
 
-    # Unpack remaining elevators
     for name, result in zip(non_scoular_tasks.keys(), other_results):
         if isinstance(result, Exception):
             logger.error(f"{name}: unhandled exception: {result}")
