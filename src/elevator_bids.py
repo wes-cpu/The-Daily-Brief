@@ -23,6 +23,7 @@ import re
 import time
 from typing import Optional
 
+import requests as req
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,124 @@ async def _new_page(context: BrowserContext, timeout: int = DEFAULT_TIMEOUT) -> 
 
 
 # ---------------------------------------------------------------------------
+# Direct Barchart WebSol API — no browser required
+# ---------------------------------------------------------------------------
+
+def _try_barchart_direct_api(url: str, elevator_name: str) -> list[dict]:
+    """
+    Fetch the page HTML with requests (no JS), extract the Barchart WebSol
+    API key + location ID, then call the Barchart getCashBids API directly.
+
+    This bypasses Cloudflare JS challenges on the host page and is much
+    faster and more reliable than browser-based response interception.
+    """
+    try:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }
+        resp = req.get(url, headers=headers, timeout=20, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.debug(f"{elevator_name}: HTML pre-fetch returned {resp.status_code}")
+            return []
+
+        html = resp.text
+        api_key = None
+        location_id = None
+
+        # Pattern 1: script src with apikey param
+        # e.g., <script src="https://widgets.websol.barchart.com/...?apikey=ABC&locationId=123">
+        for m in re.finditer(
+            r'<script[^>]+src=["\']([^"\']*websol\.barchart\.com[^"\']*)["\']',
+            html, re.IGNORECASE
+        ):
+            src = m.group(1)
+            ak = re.search(r'[?&]apikey=([A-Za-z0-9_-]+)', src, re.IGNORECASE)
+            li = re.search(r'[?&]locationId=(\d+)', src, re.IGNORECASE)
+            if ak:
+                api_key = ak.group(1)
+            if li:
+                location_id = li.group(1)
+            if api_key and location_id:
+                break
+
+        # Pattern 2: web-component attributes
+        # e.g., <bc-cash-bids apikey="ABC" locationid="123">
+        if not api_key:
+            m = re.search(
+                r'(?:apikey|api-key)\s*=\s*["\']([A-Za-z0-9_-]{6,})["\']',
+                html, re.IGNORECASE
+            )
+            if m:
+                api_key = m.group(1)
+        if not location_id:
+            m = re.search(
+                r'locationid\s*=\s*["\']?(\d+)["\']?',
+                html, re.IGNORECASE
+            )
+            if m:
+                location_id = m.group(1)
+
+        # Pattern 3: inline JS object / JSON config
+        if not api_key:
+            m = re.search(
+                r'["\']?apiKey["\']?\s*[:=]\s*["\']([A-Za-z0-9_-]{6,})["\']',
+                html
+            )
+            if m:
+                api_key = m.group(1)
+        if not location_id:
+            m = re.search(
+                r'["\']?locationId["\']?\s*[:=]\s*["\']?(\d+)["\']?',
+                html
+            )
+            if m:
+                location_id = m.group(1)
+
+        if not (api_key and location_id):
+            logger.debug(f"{elevator_name}: no Barchart config found in HTML pre-fetch")
+            return []
+
+        logger.info(
+            f"{elevator_name}: found Barchart config "
+            f"(apiKey=***{api_key[-4:]}, locationId={location_id})"
+        )
+
+        api_url = (
+            "https://ondemand.websol.barchart.com/getCashBids.json"
+            f"?apikey={api_key}&locationId={location_id}"
+            "&orderBy=contractExpDate&maxRecords=30"
+        )
+        origin_host = "/".join(url.split("/")[:3])
+        api_resp = req.get(
+            api_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": url,
+                "Origin": origin_host,
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+        if api_resp.status_code == 200:
+            data = api_resp.json()
+            bids = _extract_bids_from_response(data, elevator_name)
+            logger.info(f"{elevator_name}: {len(bids)} bids via direct Barchart API")
+            return bids
+        else:
+            logger.debug(
+                f"{elevator_name}: Barchart API returned {api_resp.status_code}"
+            )
+
+    except Exception as exc:
+        logger.debug(f"{elevator_name}: direct Barchart API error: {exc}")
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Generic JSON bid extractor — handles any API response shape
 # ---------------------------------------------------------------------------
 
@@ -319,16 +438,17 @@ async def _fetch_barchart_bids(
     elevator_name: str,
 ) -> list[dict]:
     """
-    For Barchart-WebSol-powered sites: capture cash-bid data from any JSON
-    response.  Falls back to parsing rendered HTML on failure.
-
-    Key changes vs. prior version:
-    - wait_until="load" (not "networkidle") — prevents 30-s stall on
-      sites that keep polling forever.
-    - Captures ALL non-HTML/non-image JSON responses, not just URL-matched ones.
-    - Reduced selector wait (3 s each, 3 selectors) to cut dead time.
-    - asyncio.sleep shortened to 5 s.
+    For Barchart-WebSol-powered sites: three-tier strategy:
+      1. Direct HTTP + Barchart API (fastest; bypasses Cloudflare on host page)
+      2. Playwright JSON response intercept
+      3. Rendered HTML parse fallback
     """
+    # Tier 1: direct HTTP — extract API key from page HTML, call API directly
+    direct_bids = await asyncio.to_thread(_try_barchart_direct_api, url, elevator_name)
+    if direct_bids:
+        return direct_bids
+
+    # Tier 2: Playwright response interception
     captured_bids: list[dict] = []
     api_captured = False
 
@@ -338,12 +458,8 @@ async def _fetch_barchart_bids(
             if response.status >= 400:
                 return
             ct = response.headers.get("content-type", "")
-            # Skip obvious non-data types
-            if any(s in ct for s in (
-                "text/html", "image/", "font/", "text/css",
-            )):
+            if any(s in ct for s in ("text/html", "image/", "font/", "text/css")):
                 return
-            # Accept json, empty content-type, and anything not explicitly excluded
             try:
                 body = await response.json()
             except Exception:
@@ -370,23 +486,39 @@ async def _fetch_barchart_bids(
     except Exception as e:
         logger.warning(f"{elevator_name}: navigation: {e}")
 
-    # Wait briefly for widget/content selectors — 3 s each, stop on first hit
+    # Wait for network to settle (all XHR/fetch done), then extra sleep
+    try:
+        await page.wait_for_load_state("networkidle", timeout=12_000)
+    except Exception:
+        pass
+
     for sel in ("[class*='bid']", "[class*='cash']", "table tbody tr td"):
         try:
-            await page.wait_for_selector(sel, timeout=3_000)
+            await page.wait_for_selector(sel, timeout=5_000)
             break
         except Exception:
             continue
 
-    await asyncio.sleep(5)
+    await asyncio.sleep(12)
 
     if api_captured and captured_bids:
         logger.info(f"{elevator_name}: {len(captured_bids)} bids via JSON intercept")
         return captured_bids
 
-    # Fallback: parse HTML table
+    # Tier 3: parse rendered HTML table
     logger.info(f"{elevator_name}: JSON intercept missed; falling back to HTML parse")
-    return await _parse_barchart_html(page, elevator_name)
+    bids = await _parse_barchart_html(page, elevator_name)
+    if not bids:
+        # Dump page content for debugging
+        try:
+            content = await page.content()
+            logger.debug(
+                f"{elevator_name}: page HTML snippet (first 500 chars): "
+                f"{content[:500].replace(chr(10), ' ')}"
+            )
+        except Exception:
+            pass
+    return bids
 
 
 async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
@@ -687,6 +819,10 @@ async def scrape_adm_gradable(
                 if bids:
                     api_hit = True
                     api_bids.extend(bids)
+                    logger.debug(
+                        f"{elevator_name}: captured {len(bids)} bids "
+                        f"from {response.url[:80]}"
+                    )
             except Exception:
                 pass
 
@@ -697,20 +833,36 @@ async def scrape_adm_gradable(
         except Exception as e:
             logger.warning(f"{elevator_name}: navigation: {e}")
 
-        for sel in ("[class*='bid']", "table tbody tr", "[class*='BidTable']"):
+        # React apps need networkidle + extra time
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
+
+        for sel in ("[class*='bid']", "table tbody tr", "[class*='BidTable']",
+                    "[class*='bid-row']", "[class*='BidRow']", "[class*='cash']"):
             try:
-                await page.wait_for_selector(sel, timeout=3_000)
+                await page.wait_for_selector(sel, timeout=5_000)
                 break
             except Exception:
                 continue
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(15)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API intercept")
             return api_bids
 
         bids = await _parse_adm_gradable_html(page, elevator_name)
+        if not bids:
+            try:
+                content = await page.content()
+                logger.debug(
+                    f"{elevator_name}: page HTML snippet: "
+                    f"{content[:500].replace(chr(10), ' ')}"
+                )
+            except Exception:
+                pass
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
 
@@ -909,13 +1061,27 @@ async def scrape_chs_illinois(context: BrowserContext) -> list[dict]:
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(5)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:
+            pass
+
+        await asyncio.sleep(12)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Lowder+Cahokia)")
             return api_bids
 
         bids = await _parse_chs_html(page, elevator_name, target_locations)
+        if not bids:
+            try:
+                content = await page.content()
+                logger.debug(
+                    f"{elevator_name}: page HTML snippet: "
+                    f"{content[:500].replace(chr(10), ' ')}"
+                )
+            except Exception:
+                pass
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
 
@@ -1058,13 +1224,27 @@ async def scrape_gpre_madison(context: BrowserContext) -> list[dict]:
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(5)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:
+            pass
+
+        await asyncio.sleep(12)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Madison IL)")
             return api_bids
 
         bids = await _parse_gpre_html(page, elevator_name, target_location)
+        if not bids:
+            try:
+                content = await page.content()
+                logger.debug(
+                    f"{elevator_name}: page HTML snippet: "
+                    f"{content[:500].replace(chr(10), ' ')}"
+                )
+            except Exception:
+                pass
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
         return bids
 
