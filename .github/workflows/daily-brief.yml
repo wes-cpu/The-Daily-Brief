@@ -16,6 +16,8 @@ jobs:
   send-daily-brief:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -57,7 +59,7 @@ jobs:
             echo "No changes to CSV data — nothing to commit"
           else
             git commit -m "chore: update market data CSVs [$(date -u '+%Y-%m-%d')]"
-            git push https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git HEAD:${GITHUB_REF_NAME}
+            git push https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:${GITHUB_REF_NAME}
           fi
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import time
+import urllib.request
 from typing import Optional
 
 from playwright.async_api import async_playwright, Page, BrowserContext
@@ -310,8 +311,119 @@ def _extract_bids_from_response(body: object, elevator_name: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Barchart WebSol helper: intercept any JSON response containing bid data
+# Barchart WebSol helper: intercept JSON responses + try direct API call
 # ---------------------------------------------------------------------------
+
+def _try_barchart_direct_api(
+    page_html: str,
+    elevator_name: str,
+) -> list[dict]:
+    """
+    Extract Barchart widget config from page HTML and call ondemand API directly.
+    Many Barchart WebSol sites embed site/email config in inline <script> tags.
+    Returns bids list (may be empty on failure).
+    """
+    try:
+        # Common patterns for Barchart widget initialization
+        site = None
+        email_param = None
+
+        # Pattern 1: BCH_cashBid({...}) or BCH_init({...})
+        for pattern in [
+            r'BCH\w*\s*\(\s*\{[^}]*"site"\s*:\s*"([^"]+)"',
+            r'BCH\w*\s*\(\s*\{[^}]*site\s*:\s*["\']([^"\']+)["\']',
+            r'"siteCode"\s*:\s*"([^"]+)"',
+            r"'siteCode'\s*:\s*'([^']+)'",
+            r'"site"\s*:\s*"([^"]+)"',
+            r"data-site=['\"]([^'\"]+)['\"]",
+        ]:
+            m = re.search(pattern, page_html)
+            if m:
+                site = m.group(1)
+                break
+
+        for pattern in [
+            r'"email"\s*:\s*"([^@"]+@[^"]+)"',
+            r"'email'\s*:\s*'([^@']+@[^']+)'",
+            r'data-email=["\']([^"\'@]+@[^"\']+)["\']',
+        ]:
+            m = re.search(pattern, page_html)
+            if m:
+                email_param = m.group(1)
+                break
+
+        if not site:
+            return []
+
+        # Call Barchart ondemand API
+        api_url = "https://ondemand.barchart.com/ondemand/api/getCashBids"
+        params = f"?site={site}"
+        if email_param:
+            import urllib.parse
+            params += f"&email={urllib.parse.quote(email_param)}"
+        params += "&type=1"
+        full_url = api_url + params
+
+        logger.info(f"{elevator_name}: trying Barchart direct API: {full_url}")
+        req = urllib.request.Request(
+            full_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+                "Referer": "https://widgets.barchart.com/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+
+        bids = _extract_bids_from_response(body, elevator_name)
+        if bids:
+            logger.info(f"{elevator_name}: {len(bids)} bids via Barchart direct API")
+        return bids
+
+    except Exception as e:
+        logger.debug(f"{elevator_name}: Barchart direct API failed: {e}")
+        return []
+
+
+def _extract_embedded_json_bids(page_html: str, elevator_name: str) -> list[dict]:
+    """
+    Look for JSON-encoded bid data embedded in page HTML as script variables
+    or application/json script tags.  Returns bids list (may be empty).
+    """
+    # Pattern 1: <script type="application/json">...</script>
+    for m in re.finditer(r'<script[^>]+type=["\']application/json["\'][^>]*>([\s\S]*?)</script>', page_html, re.IGNORECASE):
+        try:
+            body = json.loads(m.group(1))
+            bids = _extract_bids_from_response(body, elevator_name)
+            if bids:
+                logger.info(f"{elevator_name}: {len(bids)} bids from embedded JSON script")
+                return bids
+        except Exception:
+            pass
+
+    # Pattern 2: window.__DATA__ = {...} or var bidData = {...}
+    for pattern in [
+        r'window\.__DATA__\s*=\s*(\{[\s\S]*?\});',
+        r'window\.cashBids\s*=\s*(\[[\s\S]*?\]);',
+        r'var\s+bidData\s*=\s*(\{[\s\S]*?\});',
+        r'var\s+cashBids\s*=\s*(\[[\s\S]*?\]);',
+        r'"cashBids"\s*:\s*(\[[\s\S]*?\])',
+        r'"bids"\s*:\s*(\[[\s\S]*?\])',
+    ]:
+        m = re.search(pattern, page_html)
+        if m:
+            try:
+                body = json.loads(m.group(1))
+                bids = _extract_bids_from_response(body, elevator_name)
+                if bids:
+                    logger.info(f"{elevator_name}: {len(bids)} bids from inline JS variable")
+                    return bids
+            except Exception:
+                pass
+
+    return []
+
 
 async def _fetch_barchart_bids(
     page: Page,
@@ -319,15 +431,14 @@ async def _fetch_barchart_bids(
     elevator_name: str,
 ) -> list[dict]:
     """
-    For Barchart-WebSol-powered sites: capture cash-bid data from any JSON
-    response.  Falls back to parsing rendered HTML on failure.
+    For Barchart-WebSol-powered sites: capture cash-bid data.
 
-    Key changes vs. prior version:
-    - wait_until="load" (not "networkidle") — prevents 30-s stall on
-      sites that keep polling forever.
-    - Captures ALL non-HTML/non-image JSON responses, not just URL-matched ones.
-    - Reduced selector wait (3 s each, 3 selectors) to cut dead time.
-    - asyncio.sleep shortened to 5 s.
+    Strategy (in order):
+    1. Intercept any JSON API response fired while the page loads.
+    2. After load, try to call the Barchart ondemand API directly using
+       widget config extracted from the page HTML.
+    3. Look for bid data embedded as inline JSON in script tags.
+    4. Fall back to parsing rendered HTML tables.
     """
     captured_bids: list[dict] = []
     api_captured = False
@@ -338,12 +449,10 @@ async def _fetch_barchart_bids(
             if response.status >= 400:
                 return
             ct = response.headers.get("content-type", "")
-            # Skip obvious non-data types
             if any(s in ct for s in (
                 "text/html", "image/", "font/", "text/css",
             )):
                 return
-            # Accept json, empty content-type, and anything not explicitly excluded
             try:
                 body = await response.json()
             except Exception:
@@ -370,7 +479,7 @@ async def _fetch_barchart_bids(
     except Exception as e:
         logger.warning(f"{elevator_name}: navigation: {e}")
 
-    # Wait briefly for widget/content selectors — 3 s each, stop on first hit
+    # Wait for widget/content selectors — 3 s each, stop on first hit
     for sel in ("[class*='bid']", "[class*='cash']", "table tbody tr td"):
         try:
             await page.wait_for_selector(sel, timeout=3_000)
@@ -378,13 +487,25 @@ async def _fetch_barchart_bids(
         except Exception:
             continue
 
-    await asyncio.sleep(5)
+    # Longer wait to allow async widget to fully load
+    await asyncio.sleep(10)
 
     if api_captured and captured_bids:
         logger.info(f"{elevator_name}: {len(captured_bids)} bids via JSON intercept")
         return captured_bids
 
-    # Fallback: parse HTML table
+    # Strategy 2: Extract Barchart widget config and call API directly
+    page_html = await page.content()
+    bids = _try_barchart_direct_api(page_html, elevator_name)
+    if bids:
+        return bids
+
+    # Strategy 3: Look for embedded JSON in the page HTML
+    bids = _extract_embedded_json_bids(page_html, elevator_name)
+    if bids:
+        return bids
+
+    # Strategy 4: Parse HTML table
     logger.info(f"{elevator_name}: JSON intercept missed; falling back to HTML parse")
     return await _parse_barchart_html(page, elevator_name)
 
@@ -393,77 +514,107 @@ async def _parse_barchart_html(page: Page, elevator_name: str) -> list[dict]:
     """Parse rendered Barchart cash-bid table from page HTML."""
     bids = []
     try:
+        # Try all tables on page — Barchart widget table may not have distinctive class
         selectors = [
             "table.cash-bids", "table.bids-table", ".cashbid-table table",
             "table[class*='cashbid']", "table[class*='cash-bid']",
             "table[class*='bids']", "div.cashbid", "table",
         ]
-        table = None
+        tables_to_try = []
         for sel in selectors:
             try:
-                table = await page.query_selector(sel)
-                if table:
-                    break
+                found = await page.query_selector_all(sel)
+                for t in found:
+                    if t not in tables_to_try:
+                        tables_to_try.append(t)
             except Exception:
                 continue
 
-        if not table:
+        if not tables_to_try:
             logger.warning(f"{elevator_name}: no table found in HTML fallback")
             return bids
 
-        rows = await table.query_selector_all("tr")
-        header_row = rows[0] if rows else None
-        headers = []
-        if header_row:
+        for table in tables_to_try:
+            rows = await table.query_selector_all("tr")
+            if not rows:
+                continue
+
+            # Find header row
+            header_row = None
+            for row in rows[:3]:
+                ths = await row.query_selector_all("th")
+                if ths:
+                    header_row = row
+                    break
+            if header_row is None:
+                header_row = rows[0]
+
             ths = await header_row.query_selector_all("th, td")
             headers = [await th.inner_text() for th in ths]
             headers = [h.strip().lower() for h in headers]
 
-        col = {}
-        for i, h in enumerate(headers):
-            if any(k in h for k in ("commodity", "grain", "crop")):
-                col.setdefault("commodity", i)
-            elif any(k in h for k in ("delivery", "period", "month", "start")):
-                col.setdefault("delivery", i)
-            elif any(k in h for k in ("cash", "bid", "price")) and "futures" not in h:
-                col.setdefault("cash", i)
-            elif "basis" in h:
-                col.setdefault("basis", i)
-            elif any(k in h for k in ("futures", "contract", "symbol")):
-                col.setdefault("futures_ref", i)
-            elif any(k in h for k in ("change", "chg")):
-                col.setdefault("change", i)
+            col = {}
+            for i, h in enumerate(headers):
+                if any(k in h for k in ("commodity", "grain", "crop", "description")):
+                    col.setdefault("commodity", i)
+                elif any(k in h for k in ("delivery", "period", "month", "start", "contract")):
+                    col.setdefault("delivery", i)
+                elif any(k in h for k in ("cash", "bid", "price")) and "futures" not in h and "basis" not in h:
+                    col.setdefault("cash", i)
+                elif "basis" in h:
+                    col.setdefault("basis", i)
+                elif any(k in h for k in ("futures", "symbol")):
+                    col.setdefault("futures_ref", i)
+                elif any(k in h for k in ("change", "chg", "net")):
+                    col.setdefault("change", i)
 
-        def _get(vals, key, default_idx):
-            idx = col.get(key, default_idx)
-            return vals[idx] if idx < len(vals) else ""
+            def _get(vals, key, default_idx):
+                idx = col.get(key, default_idx)
+                return vals[idx] if idx < len(vals) else ""
 
-        for row in rows[1:]:
-            cells = await row.query_selector_all("td")
-            if not cells:
-                continue
-            vals = [await c.inner_text() for c in cells]
-            vals = [v.strip() for v in vals]
+            data_rows = [r for r in rows if r is not header_row]
+            for row in data_rows:
+                cells = await row.query_selector_all("td")
+                if not cells:
+                    continue
+                vals = [await c.inner_text() for c in cells]
+                vals = [v.strip() for v in vals]
+                if len(vals) < 2:
+                    continue
 
-            commodity = _get(vals, "commodity", 0)
-            delivery  = _get(vals, "delivery",  1)
-            cash_raw  = _get(vals, "cash",      2)
-            basis_raw = _get(vals, "basis",     3)
-            futures_ref = _get(vals, "futures_ref", 4)
-            change_raw  = _get(vals, "change",      5)
+                commodity = _get(vals, "commodity", 0)
+                if not commodity or not _looks_like_grain(commodity):
+                    continue
 
-            cash_price = _parse_price(cash_raw)
-            basis = _parse_basis(basis_raw)
-            if commodity and cash_price is not None:
-                bids.append({
-                    "elevator": elevator_name,
-                    "commodity": commodity,
-                    "delivery_period": delivery,
-                    "cash_price": cash_price,
-                    "basis": basis,
-                    "futures_reference": futures_ref,
-                    "change": _parse_price(change_raw),
-                })
+                delivery    = _get(vals, "delivery",    1)
+                cash_raw    = _get(vals, "cash",        2)
+                basis_raw   = _get(vals, "basis",       3)
+                futures_ref = _get(vals, "futures_ref", 4)
+                change_raw  = _get(vals, "change",      5)
+
+                cash_price = _parse_price(cash_raw)
+                if cash_price is None and len(vals) > 2:
+                    # Try scanning all cells for a dollar-ish price
+                    for v in vals[1:]:
+                        p = _parse_price(v)
+                        if p is not None and 1.0 < p < 30.0:
+                            cash_price = p
+                            break
+
+                if commodity and cash_price is not None:
+                    bids.append({
+                        "elevator": elevator_name,
+                        "commodity": commodity,
+                        "delivery_period": delivery,
+                        "cash_price": cash_price,
+                        "basis": _parse_basis(basis_raw),
+                        "futures_reference": futures_ref,
+                        "change": _parse_price(change_raw),
+                    })
+
+            if bids:
+                break  # found data in this table, stop trying others
+
     except Exception as e:
         logger.error(f"{elevator_name}: HTML parse error: {e}")
     return bids
@@ -697,18 +848,25 @@ async def scrape_adm_gradable(
         except Exception as e:
             logger.warning(f"{elevator_name}: navigation: {e}")
 
-        for sel in ("[class*='bid']", "table tbody tr", "[class*='BidTable']"):
+        # React SPAs need extra time to hydrate and fetch data
+        for sel in ("[class*='bid']", "table tbody tr", "[class*='BidTable']", "table"):
             try:
-                await page.wait_for_selector(sel, timeout=3_000)
+                await page.wait_for_selector(sel, timeout=4_000)
                 break
             except Exception:
                 continue
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API intercept")
             return api_bids
+
+        # Try embedded JSON in page HTML
+        page_html = await page.content()
+        bids = _extract_embedded_json_bids(page_html, elevator_name)
+        if bids:
+            return bids
 
         bids = await _parse_adm_gradable_html(page, elevator_name)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
@@ -909,11 +1067,17 @@ async def scrape_chs_illinois(context: BrowserContext) -> list[dict]:
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Lowder+Cahokia)")
             return api_bids
+
+        # Try embedded JSON extraction
+        page_html = await page.content()
+        bids = _extract_embedded_json_bids(page_html, elevator_name)
+        if bids:
+            return bids
 
         bids = await _parse_chs_html(page, elevator_name, target_locations)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
@@ -1058,11 +1222,17 @@ async def scrape_gpre_madison(context: BrowserContext) -> list[dict]:
         except Exception as e:
             logger.warning(f"{elevator_name}: nav warning: {e}")
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
         if api_hit and api_bids:
             logger.info(f"{elevator_name}: {len(api_bids)} bids via API (Madison IL)")
             return api_bids
+
+        # Try embedded JSON extraction
+        page_html = await page.content()
+        bids = _extract_embedded_json_bids(page_html, elevator_name)
+        if bids:
+            return bids
 
         bids = await _parse_gpre_html(page, elevator_name, target_location)
         logger.info(f"{elevator_name}: {len(bids)} bids from HTML parse")
