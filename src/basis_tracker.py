@@ -168,7 +168,7 @@ def get_basis_trend(elevator: str, commodity: str) -> dict:
         # Filter for elevator + commodity
         mask = (
             (df["elevator"].str.lower() == elevator.lower()) &
-            (df["commodity"].str.lower().str.contains(commodity.lower(), na=False))
+            (df["commodity"].str.lower().str.contains(commodity.lower(), na=False, regex=False))
         )
         sub = df[mask].copy()
 
